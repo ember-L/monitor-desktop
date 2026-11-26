@@ -92,6 +92,7 @@ struct PairResult {
     url: String,
     qr_url: String,
     lan: String,
+    ips: Vec<String>,
     port: u16,
     token: String,
     available: bool,
@@ -307,8 +308,9 @@ fn recording_status(app: State<'_, Arc<App>>) -> RecordStatus {
 }
 
 #[tauri::command]
-fn pair_info(app: State<'_, Arc<App>>) -> PairResult {
-    let info = app.wireless.ensure_started();
+fn pair_info(app: State<'_, Arc<App>>, preferred: Option<String>) -> PairResult {
+    // 每次调用都重新读取本机 IP：换 Wi‑Fi / 插网线 / 关 VPN 后二维码地址随之更新。
+    let info = app.wireless.refresh(preferred.as_deref());
     if info.available && !info.qr.is_empty() {
         app.viewer.set_qr(info.qr.clone());
     }
@@ -316,6 +318,7 @@ fn pair_info(app: State<'_, Arc<App>>) -> PairResult {
         url: info.url,
         qr_url: app.viewer.url("/qr"),
         lan: info.lan,
+        ips: info.ips,
         port: info.port,
         token: info.token,
         available: info.available,

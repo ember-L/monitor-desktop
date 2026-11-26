@@ -53,7 +53,7 @@ const state = {
   decodeFailures: 0,
   deleteArmed: '',
   busy: { devices: false, photo: false, record: false, pair: false, viewer: false },
-  wireless: { open: false, connected: false, url: '' },
+  wireless: { open: false, connected: false, url: '', info: null },
   timers: { clock: 0, rec: 0, refresh: 0, ratio: 0, deleteArm: 0 },
 };
 
@@ -907,17 +907,32 @@ async function openWireless() {
   if (!dom.wirelessModal) return;
   state.wireless.open = true;
   setHidden(dom.wirelessModal, false);
-  renderPair(null);
-  if (state.busy.pair) return;
+  renderPair(state.wireless.info || null);
+  await refreshPair({ silent: true });
+}
+
+/* 重新读取本机 IP：换 Wi‑Fi、插网线、关 VPN 后地址会变，二维码随之重建。 */
+async function refreshPair(options) {
+  const opts = options || {};
+  if (!dom.wirelessModal || state.busy.pair) return;
   state.busy.pair = true;
+  if (dom.btnRefreshIp) dom.btnRefreshIp.disabled = true;
   try {
-    const info = await invoke('pair_info');
-    state.wireless.url = info && info.url ? info.url : '';
+    const info = await invoke('pair_info', { preferred: opts.preferred || null });
+    state.wireless.info = info || null;
+    if (info && info.url) state.wireless.url = info.url;
     renderPair(info);
+    if (opts.toast) {
+      if (info && info.available && info.lan) toast('已读取本机地址：' + info.lan, 'info');
+      else toast((info && info.hint) || '没有读到本机局域网地址，请检查网络连接', 'error');
+    }
   } catch (err) {
+    state.wireless.info = null;
     renderPair({ available: false, hint: friendlyError(err, '无线服务启动失败') });
+    if (opts.toast) toast(friendlyError(err, '刷新地址失败'), 'error');
   } finally {
     state.busy.pair = false;
+    if (dom.btnRefreshIp) dom.btnRefreshIp.disabled = false;
   }
 }
 
@@ -941,6 +956,27 @@ function renderPair(info) {
   const url = info && info.url ? info.url : '';
   if (dom.wirelessUrl) setText(dom.wirelessUrl, url || '—');
   if (dom.btnCopyUrl) dom.btnCopyUrl.disabled = !url;
+
+  const ips = info && Array.isArray(info.ips) ? info.ips : [];
+  const currentIp = info && info.lan ? info.lan : '';
+  const showSelect = ips.length > 1;
+  if (dom.wirelessIpCurrent) {
+    setText(dom.wirelessIpCurrent, currentIp || '—');
+    dom.wirelessIpCurrent.hidden = showSelect;
+  }
+  if (dom.wirelessIp) {
+    dom.wirelessIp.textContent = '';
+    dom.wirelessIp.hidden = !showSelect;
+    if (showSelect) {
+      ips.forEach(function (ip) {
+        const option = document.createElement('option');
+        option.value = ip;
+        option.textContent = ip;
+        if (ip === currentIp) option.selected = true;
+        dom.wirelessIp.append(option);
+      });
+    }
+  }
 
   const connected = state.wireless.connected;
   let statusText = '等待手机连接…';
@@ -1090,7 +1126,7 @@ function onWireless(payload) {
   state.wireless.connected = !!payload.connected;
   state.wireless.name = payload.name || '';
   if (payload.hint && dom.wirelessHint && state.wireless.open) setText(dom.wirelessHint, payload.hint);
-  if (dom.wirelessStatus && state.wireless.open) renderPair({ url: state.wireless.url, available: true });
+  if (dom.wirelessStatus && state.wireless.open) renderPair(state.wireless.info || { url: state.wireless.url, available: true });
   if (!payload.connected) return;
   toast('手机已连接：' + (payload.name || '无线设备'), 'info');
   const label = payload.name ? '无线 · ' + payload.name : '无线设备';
@@ -1131,7 +1167,8 @@ function cacheDom() {
     'stage-grid', 'hud', 'hud-clock', 'hud-res', 'hud-fps', 'rec-badge', 'rec-badge-time',
     'stage-empty', 'stage-empty-title', 'stage-empty-detail', 'flash', 'film-list', 'film-count',
     'film-empty', 'toasts', 'wireless-modal', 'wireless-qr', 'wireless-url', 'btn-copy-url',
-    'wireless-status', 'wireless-hint', 'btn-wireless-close', 'viewer', 'viewer-title',
+    'wireless-status', 'wireless-hint', 'btn-wireless-close', 'wireless-ip', 'wireless-ip-current',
+    'btn-refresh-ip', 'viewer', 'viewer-title',
     'viewer-stage', 'btn-viewer-close', 'viewer-meta', 'btn-viewer-open', 'btn-viewer-reveal',
     'btn-viewer-delete',
   ];
@@ -1275,6 +1312,14 @@ function bindDom() {
   });
 
   if (dom.btnCopyUrl) dom.btnCopyUrl.addEventListener('click', function () { copyWirelessUrl(); });
+  if (dom.btnRefreshIp) dom.btnRefreshIp.addEventListener('click', function () { refreshPair({ toast: true }); });
+  if (dom.wirelessIp) dom.wirelessIp.addEventListener('change', function () {
+    refreshPair({ preferred: dom.wirelessIp.value, toast: true });
+  });
+  // 切回窗口时静默同步一次本机地址（可能已经换了网络）
+  window.addEventListener('focus', function () {
+    if (state.wireless.open && !state.busy.pair) refreshPair({ silent: true });
+  });
   if (dom.btnWirelessClose) dom.btnWirelessClose.addEventListener('click', function () { closeWireless(); });
   if (dom.wirelessModal) {
     dom.wirelessModal.addEventListener('click', function (event) {

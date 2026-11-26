@@ -1146,6 +1146,55 @@ kbd {
   user-select: text;
 }
 
+.ip-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.ip-label {
+  flex: none;
+  font-size: 10px;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+  color: rgba(126, 133, 123, 0.85);
+}
+
+.ip-current {
+  flex: 1;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.ip-select {
+  flex: 1;
+  min-width: 0;
+  padding: 5px 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--panel-2);
+  color: var(--text);
+  font-size: 11px;
+}
+
+.btn-refresh-ip {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  font-size: 11px;
+}
+
+.btn-refresh-ip svg {
+  width: 13px;
+  height: 13px;
+}
+
 .wireless-status {
   margin: 0;
   font-size: 12px;

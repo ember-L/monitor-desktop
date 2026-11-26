@@ -18,6 +18,8 @@ const PHONE_PAGE: &str = include_str!("phone_page.html");
 pub struct PairInfo {
     pub url: String,
     pub lan: String,
+    /// 本机候选局域网地址（Wi‑Fi 优先），供界面切换。
+    pub ips: Vec<String>,
     pub port: u16,
     pub token: String,
     pub available: bool,
@@ -48,7 +50,16 @@ impl Wireless {
     }
 
     fn unavailable(hint: String) -> PairInfo {
-        PairInfo { url: String::new(), lan: String::new(), port: 0, token: String::new(), available: false, hint, qr: Vec::new() }
+        PairInfo {
+            url: String::new(),
+            lan: String::new(),
+            ips: Vec::new(),
+            port: 0,
+            token: String::new(),
+            available: false,
+            hint,
+            qr: Vec::new(),
+        }
     }
 
     /// 首次调用启动服务；已启动则直接返回缓存信息。
@@ -82,7 +93,8 @@ impl Wireless {
     }
 
     fn start_server(self: &Arc<Self>) -> PairInfo {
-        let Some(lan) = lan_ip() else {
+        let ips = lan_ips();
+        let Some(lan) = ips.first().cloned() else {
             return Self::unavailable("未连接局域网，请接入 Wi-Fi 或有线网络后重试".into());
         };
         let token = random_token();
@@ -121,6 +133,7 @@ impl Wireless {
         PairInfo {
             url,
             lan,
+            ips,
             port,
             token,
             available: true,
@@ -147,6 +160,40 @@ impl Wireless {
     #[allow(dead_code)]
     pub fn info(&self) -> Option<PairInfo> {
         self.info.lock().ok().and_then(|i| i.clone())
+    }
+
+    /// 重新读取本机 IP 并刷新配对地址与二维码（服务端口与 token 不变）。
+    /// `preferred` 指定候选地址时，仅在它仍是本机现存地址时才采用。
+    pub fn refresh(self: &Arc<Self>, preferred: Option<&str>) -> PairInfo {
+        let base = self.ensure_started();
+        if !base.available {
+            return base;
+        }
+        let ips = lan_ips();
+        if ips.is_empty() {
+            return base;
+        }
+        let lan = match preferred {
+            Some(p) if ips.iter().any(|ip| ip == p) => p.to_string(),
+            _ if ips.iter().any(|ip| *ip == base.lan) => base.lan.clone(),
+            _ => ips[0].clone(),
+        };
+        let url = format!("https://{lan}:{}/?t={}", base.port, base.token);
+        let qr = make_qr_png(&url).unwrap_or_default();
+        let updated = PairInfo {
+            url,
+            lan,
+            ips,
+            port: base.port,
+            token: base.token.clone(),
+            available: true,
+            hint: base.hint.clone(),
+            qr,
+        };
+        if let Ok(mut slot) = self.info.lock() {
+            *slot = Some(updated.clone());
+        }
+        updated
     }
 
     pub fn subscribe(&self) -> Receiver<Vec<u8>> {
@@ -194,8 +241,67 @@ fn tls_config(lan: &str) -> Result<Arc<rustls::ServerConfig>, String> {
     Ok(Arc::new(config))
 }
 
-/// 通过 UDP connect 探测出口网卡地址（不会真的发包）。
-fn lan_ip() -> Option<String> {
+/// 本机候选局域网 IPv4 地址（Wi‑Fi `en0` 优先）。只取 `ifconfig` 里的私有/普通地址，
+/// 排除回环、链路本地与 VPN（utun）、AWDL 等手机不可达的接口。
+pub fn lan_ips() -> Vec<String> {
+    if let Ok(out) = std::process::Command::new("ifconfig").output() {
+        if out.status.success() {
+            let list = lan_ips_from(&String::from_utf8_lossy(&out.stdout));
+            if !list.is_empty() {
+                return list;
+            }
+        }
+    }
+    udp_lan_ip().into_iter().collect()
+}
+
+const SKIP_IFACE: [&str; 8] = ["lo", "utun", "awdl", "llw", "gif", "stf", "ap", "anpi"];
+
+fn lan_ips_from(text: &str) -> Vec<String> {
+    let mut found: Vec<(u8, String, String)> = Vec::new();
+    let mut iface = String::new();
+    for line in text.lines() {
+        if !line.starts_with(char::is_whitespace) {
+            iface = line.split(':').next().unwrap_or("").trim().to_string();
+            continue;
+        }
+        let Some(rest) = line.trim().strip_prefix("inet ") else { continue };
+        let ip = rest.split_whitespace().next().unwrap_or("");
+        if iface.is_empty() || !is_lan_v4(ip) || SKIP_IFACE.iter().any(|p| iface.starts_with(p)) {
+            continue;
+        }
+        let prio = if iface == "en0" {
+            0
+        } else if iface.starts_with("en") {
+            1
+        } else if iface.starts_with("bridge") {
+            2
+        } else {
+            3
+        };
+        if !found.iter().any(|(_, _, seen)| seen == ip) {
+            found.push((prio, iface.clone(), ip.to_string()));
+        }
+    }
+    found.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    found.into_iter().map(|(_, _, ip)| ip).collect()
+}
+
+fn is_lan_v4(ip: &str) -> bool {
+    match ip.parse::<std::net::Ipv4Addr>() {
+        Ok(addr) => {
+            !addr.is_loopback()
+                && !addr.is_unspecified()
+                && !addr.is_link_local()
+                && !addr.is_broadcast()
+                && !addr.is_multicast()
+        }
+        Err(_) => false,
+    }
+}
+
+/// 兜底：通过 UDP connect 探测出口网卡地址（不会真的发包）。
+fn udp_lan_ip() -> Option<String> {
     for target in ["8.8.8.8:80", "1.1.1.1:80"] {
         if let Ok(sock) = UdpSocket::bind("0.0.0.0:0") {
             if sock.connect(target).is_ok() {
@@ -357,7 +463,7 @@ fn ws_loop(w: Arc<Wireless>, mut ws: WsConn<rustls::StreamOwned<rustls::ServerCo
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     #[test]
     fn token_is_hex_and_not_empty() {
@@ -365,6 +471,41 @@ mod tests {
         assert!(t.len() >= 8);
         assert!(t.chars().all(|c| c.is_ascii_hexdigit()));
         assert_ne!(t, random_token());
+    }
+
+    #[test]
+    fn lan_ips_prefer_wifi_and_skip_vpn() {
+        let sample = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\nen0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.31.24 netmask 0xffffff00 broadcast 192.168.31.255\nen1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 10.0.0.7 netmask 0xffff0000 broadcast 10.0.255.255\nutun3: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380\n\tinet 10.8.0.2 --> 10.8.0.2 netmask 0xffffffff\n";
+        assert_eq!(lan_ips_from(sample), vec!["192.168.31.24".to_string(), "10.0.0.7".to_string()]);
+    }
+
+    #[test]
+    fn refresh_updates_url_and_keeps_port_token() {
+        let (tx, _rx) = channel();
+        let w = Wireless::new(tx);
+        let first = w.ensure_started();
+        if !first.available {
+            w.stop();
+            return; // 无局域网环境的机器跳过
+        }
+        let refreshed = w.refresh(None);
+        assert!(refreshed.available);
+        assert_eq!(first.port, refreshed.port);
+        assert_eq!(first.token, refreshed.token);
+        assert!(!refreshed.ips.is_empty());
+        assert!(refreshed.url.starts_with(&format!("https://{}:{}/", refreshed.lan, refreshed.port)));
+        assert_eq!(&refreshed.qr[..8], b"\x89PNG\r\n\x1a\n");
+        w.stop();
+    }
+
+    #[test]
+    fn rejects_non_lan_addresses() {
+        assert!(is_lan_v4("192.168.1.5"));
+        assert!(!is_lan_v4("127.0.0.1"));
+        assert!(!is_lan_v4("169.254.10.2"));
+        assert!(!is_lan_v4("255.255.255.255"));
+        assert!(!is_lan_v4("224.0.0.251"));
+        assert!(!is_lan_v4("not-an-ip"));
     }
 
     #[test]

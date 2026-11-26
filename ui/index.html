@@ -200,6 +200,15 @@
           <code class="url mono" id="wireless-url">—</code>
           <button class="btn btn-quiet" id="btn-copy-url" type="button">复制</button>
         </div>
+        <div class="ip-row">
+          <span class="ip-label">本机 IP</span>
+          <span class="ip-current mono" id="wireless-ip-current">—</span>
+          <select class="ip-select mono" id="wireless-ip" aria-label="选择本机 IP 地址" hidden></select>
+          <button class="btn btn-quiet btn-refresh-ip" id="btn-refresh-ip" type="button" title="重新读取本机 IP 地址">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M15.6 8.1a5.8 5.8 0 1 0 .3 4M15.6 4.2v3.9h-3.9" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" /></svg>
+            <span>刷新地址</span>
+          </button>
+        </div>
         <p class="wireless-status" id="wireless-status">等待手机连接…</p>
         <p class="wireless-hint" id="wireless-hint">手机与电脑连同一个 Wi‑Fi；首次打开需要在手机上信任本地证书。</p>
       </div>
