@@ -143,6 +143,8 @@ Windows 安装包（NSIS `.exe` + MSI）必须在 Windows 上构建：Tauri 打�
 
    交叉编译要求本机有 LLVM 的 `llvm-rc` / `lld-link`（Tauri 要往 exe 里写图标和版本资源）；缺了会在 `tauri-winres` 处报 `NotAttempted("llvm-rc")`，此时只能用第 1、2 种做法。
 
+安装包没有代码签名，Windows SmartScreen 会拦一次：点「更多信息」→「仍要运行」即可。
+
 Windows 上还需要 ffmpeg 才能用本机摄像头和 Android 投屏（手机扫码的无线取景不需要）：`winget install Gyan.FFmpeg`，或把 `ffmpeg.exe` 放到应用目录，或设置 `MONITOR_FFMPEG` 指向它；Android 需 platform-tools（`%LOCALAPPDATA%\Android\Sdk\platform-tools\adb.exe`）。WebView2 缺失时安装包会自动下载安装。
 
 ## 网页版（旧）

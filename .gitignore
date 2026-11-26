@@ -18,6 +18,9 @@
 /.xwin-cache
 /.brew-cache
 
+# 本机下载的 Windows 构建产物
+/dist-windows
+
 # 本地生成的证书 / 临时脚本产物
 /.certs
 /.tmp
