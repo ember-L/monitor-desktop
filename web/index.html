@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#08090A">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="description" content="在浏览器中实时查看手机或电脑摄像头画面，支持拍照、录像与下载。">
+<title>MONITOR · 实时取景</title>
+<link rel="stylesheet" href="assets/css/style.css">
+</head>
+<body>
+<div class="grain" aria-hidden="true"></div>
+
+<header class="topbar">
+  <div class="brand">
+    <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+      <circle cx="16" cy="16" r="13" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <circle cx="16" cy="16" r="5.4" fill="none" stroke="currentColor" stroke-width="1.4"/>
+      <path d="M16 3v5.2M29 16h-5.2M16 29v-5.2M3 16h5.2" stroke="currentColor" stroke-width="1.4" stroke-linecap="round"/>
+      <circle cx="16" cy="16" r="1.6" fill="currentColor"/>
+    </svg>
+    <span class="brand-name">MONITOR</span>
+    <span class="brand-sub">CAMERA VIEWFINDER</span>
+  </div>
+  <div class="status-cluster">
+    <span class="pill" id="statusPill" data-state="idle"><i class="dot"></i><span id="statusText">待机</span></span>
+    <span class="pill mono hide-sm" id="resPill">— × —</span>
+    <span class="pill mono hide-sm" id="fpsPill">— FPS</span>
+    <span class="pill mono" id="clock">--:--:--</span>
+  </div>
+</header>
+
+<main class="shell">
+  <section class="stage-wrap">
+    <div class="stage" id="stage">
+      <video id="video" playsinline autoplay muted aria-label="摄像头实时画面"></video>
+      <video id="remoteVideo" playsinline autoplay muted hidden aria-label="手机推流的实时画面"></video>
+
+      <div class="grid-overlay" id="grid" aria-hidden="true">
+        <span class="gv v1"></span><span class="gv v2"></span>
+        <span class="gh h1"></span><span class="gh h2"></span>
+      </div>
+
+      <div class="stage-wait" id="stageWait" hidden>
+        <div class="wait-inner">
+          <p class="eyebrow"><span class="blink"></span>PAIRING · 等待手机</p>
+          <div class="wait-qr" id="waitQr"></div>
+          <p class="wait-url mono" id="waitUrl"></p>
+          <p class="wait-status" id="waitStatus">手机扫码打开后会自动开始推流</p>
+          <p class="wait-hint" id="waitHint">手机与电脑需在同一个 Wi-Fi；首次访问需点「继续访问」信任本地证书。</p>
+        </div>
+      </div>
+
+      <div class="stage-idle" id="idle">
+        <div class="idle-inner">
+          <p class="eyebrow"><span class="blink"></span>NO SIGNAL · 无信号</p>
+          <h1>实时取景<em>live viewfinder</em></h1>
+          <p class="idle-desc">授权摄像头后，这里会显示手机或电脑摄像头的实时画面。画面不会上传到任何服务器，全部留在你的设备上。</p>
+          <p class="idle-desc idle-sub">想让电脑直接看手机的镜头？在手机打开本页，用「手机推流」把画面投过来即可。</p>
+          <button id="startBtn" class="shutter" type="button">
+            <span class="shutter-ring"></span>
+            <span class="shutter-core">
+              <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 8.5A2.5 2.5 0 0 1 6.5 6h1.2a2 2 0 0 0 1.7-.95l.5-.8A2 2 0 0 1 11.6 3h.8a2 2 0 0 1 1.7.95l.5.8A2 2 0 0 0 16.3 6h1.2A2.5 2.5 0 0 1 20 8.5v9A2.5 2.5 0 0 1 17.5 20h-11A2.5 2.5 0 0 1 4 17.5v-9Z" fill="none" stroke="currentColor" stroke-width="1.5"/><circle cx="12" cy="13" r="3.6" fill="none" stroke="currentColor" stroke-width="1.5"/></svg>
+            </span>
+            <span class="shutter-label">启用摄像头</span>
+          </button>
+          <p class="hint" id="hint">需要 HTTPS 或 localhost 才能访问摄像头</p>
+          <p class="cast-invite" id="castInvite" hidden>电脑端正在等这台手机的镜头</p>
+          <button id="castStartBtn" class="btn btn-primary btn-invite" type="button" hidden>开始推流到电脑</button>
+          <button id="castDismiss" class="ghost tiny" type="button" hidden>不用手机，在本机取景</button>
+          <button id="localCamBtn" class="ghost tiny" type="button" hidden>改用这台电脑的摄像头</button>
+        </div>
+      </div>
+
+      <div class="hud" id="hud" aria-hidden="true">
+        <span class="hud-live" id="hudLive"><i class="rec-dot"></i><b>LIVE</b><span id="hudFacing">后置</span></span>
+        <span class="hud-res mono" id="hudRes">—</span>
+        <span class="hud-time mono" id="hudTime">--:--:--</span>
+        <span class="hud-id mono">MONITOR&nbsp;/&nbsp;01</span>
+        <span class="hud-rec" id="hudRec"><i class="rec-dot"></i>REC <b id="recTime">00:00</b></span>
+      </div>
+
+      <span class="corner tl"></span><span class="corner tr"></span>
+      <span class="corner bl"></span><span class="corner br"></span>
+      <div class="flash" id="flash" aria-hidden="true"></div>
+    </div>
+
+    <div class="filmstrip-bar">
+      <div class="filmstrip-head">
+        <span class="label">胶片 · 已拍摄 <b id="shotCount">0</b></span>
+        <button id="clearBtn" class="ghost tiny" type="button">清空</button>
+      </div>
+      <div class="filmstrip" id="filmstrip">
+        <p class="empty">还没有照片 — 按下快门开始</p>
+      </div>
+    </div>
+  </section>
+
+  <aside class="rail">
+    <div class="rail-block">
+      <p class="label">快门</p>
+      <button id="captureBtn" class="btn btn-primary" type="button" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="8.2" fill="none" stroke="currentColor" stroke-width="1.6"/><circle cx="12" cy="12" r="4.4" fill="currentColor"/></svg>
+        拍照
+        <kbd>Space</kbd>
+      </button>
+      <button id="recordBtn" class="btn btn-record" type="button" disabled>
+        <i class="rec-dot"></i><span id="recordLabel">开始录制</span>
+        <kbd>R</kbd>
+      </button>
+    </div>
+
+    <div class="rail-block">
+      <p class="label">镜头</p>
+      <button id="switchBtn" class="btn" type="button" disabled>
+        <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9a8 8 0 0 1 13.6-4.6L20 6.8M20 15a8 8 0 0 1-13.6 4.6L4 17.2" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><path d="M20 3v4h-4M4 21v-4h4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        切换前后摄像头
+      </button>
+      <div class="row">
+        <button id="mirrorBtn" class="btn btn-toggle" type="button" aria-pressed="false" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v18M8 6 3 12l5 6M16 6l5 6-5 6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          镜像
+        </button>
+        <button id="gridBtn" class="btn btn-toggle" type="button" aria-pressed="true" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="3.5" y="3.5" width="17" height="17" rx="2" fill="none" stroke="currentColor" stroke-width="1.4"/><path d="M9 3.5v17M15 3.5v17M3.5 9h17M3.5 15h17" stroke="currentColor" stroke-width="1.4"/></svg>
+          网格
+        </button>
+      </div>
+      <div class="row">
+        <button id="torchBtn" class="btn btn-toggle" type="button" aria-pressed="false" hidden>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6l-.8 5H9.8L9 3Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M9.8 8h4.4l-.6 3.2h-3.2L9.8 8Z" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/><path d="M10.4 11.2 9 21h6l-1.4-9.8" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linejoin="round"/></svg>
+          补光
+        </button>
+        <button id="fullBtn" class="btn btn-toggle" type="button" disabled>
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 9V4h5M20 9V4h-5M4 15v5h5M20 15v5h-5" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          全屏
+        </button>
+      </div>
+    </div>
+
+    <div class="rail-block rail-rtc">
+      <p class="label">手机镜头</p>
+      <div class="rtc-box" id="rtcBox">
+        <button id="phoneCastBtn" class="btn btn-primary" type="button">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><rect x="7" y="2.6" width="10" height="18.8" rx="2.4" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10.6 5.4h2.8" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="12" cy="18.2" r="1.05" fill="currentColor"/></svg>
+          <span id="phoneCastLabel">用手机当摄像头</span>
+        </button>
+        <div class="rtc-wait" id="rtcWait" hidden>
+          <p class="rtc-status" id="rtcStatus">等待手机接入…</p>
+          <p class="rtc-quality mono" id="rtcQuality" hidden></p>
+          <div class="rtc-actions">
+            <button id="rtcCopy" class="btn btn-small" type="button">复制链接</button>
+            <button id="rtcCancel" class="btn btn-small btn-danger" type="button">取消</button>
+          </div>
+        </div>
+        <p class="rtc-note" id="rtcNote">点上方按钮生成链接，手机扫码打开后会自动接入，这台电脑直接显示手机摄像头的实时画面。</p>
+      </div>
+    </div>
+
+    <div class="rail-block rail-qr" id="qrPanel" hidden>
+      <p class="label">在手机上打开</p>
+      <div class="qr-box" id="qrBox"></div>
+      <p class="qr-url mono" id="qrUrl"></p>
+      <p class="qr-note" id="qrNote">手机与电脑连同一个 Wi-Fi，扫码即可。<br>地址会自动检测当前网络，换 Wi-Fi 后刷新页面即可更新。<br>首次访问需在提示中「继续访问」以信任本地证书。</p>
+    </div>
+
+    <div class="rail-block rail-meta">
+      <p class="label">状态</p>
+      <dl class="meta">
+        <div><dt>设备</dt><dd id="metaDevice">—</dd></div>
+        <div><dt>分辨率</dt><dd id="metaRes">—</dd></div>
+        <div><dt>连接</dt><dd id="metaSecure">—</dd></div>
+        <div><dt>访问地址</dt><dd id="metaHost">—</dd></div>
+      </dl>
+      <p class="foot-note">画面只在本地处理，不上传、不留存于服务器。</p>
+    </div>
+  </aside>
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<div class="castbar" id="castBar" hidden>
+  <span class="cast-dot"></span>
+  <span class="cast-text" id="castText">正在推流到电脑</span>
+  <button id="castStop" class="btn btn-small btn-danger" type="button">停止推流</button>
+</div>
+
+<div class="lightbox" id="lightbox" hidden>
+  <button class="lb-close" id="lbClose" type="button" aria-label="关闭">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="m6 6 12 12M18 6 6 18" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/></svg>
+  </button>
+  <div class="lb-stage" id="lbStage"></div>
+  <div class="lb-bar">
+    <span class="mono" id="lbMeta"></span>
+    <span class="lb-actions">
+      <a id="lbDownload" class="btn btn-small" download>下载</a>
+      <button id="lbDelete" class="btn btn-small btn-danger" type="button">删除</button>
+    </span>
+  </div>
+</div>
+
+<script src="vendor/qrcode.js"></script>
+<script src="assets/js/app.js"></script>
+</body>
+</html>

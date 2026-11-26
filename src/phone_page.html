@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e0e0e">
+<title>MONITOR · 手机取景</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: #0e0e0e; color: #e8e8e8;
+    font: 15px/1.5 -apple-system, "PingFang SC", "Noto Sans SC", sans-serif;
+    min-height: 100vh; display: flex; flex-direction: column; align-items: center;
+    padding: 16px 16px calc(24px + env(safe-area-inset-bottom));
+  }
+  header { width: 100%; max-width: 560px; display: flex; align-items: baseline; gap: 10px; padding: 6px 2px 12px; }
+  header b { font-size: 18px; letter-spacing: 2px; }
+  header span { color: #888; font-size: 13px; }
+  #stage { width: 100%; max-width: 560px; background: #000; border-radius: 12px; overflow: hidden; position: relative; }
+  video { width: 100%; display: block; transform-origin: center; }
+  #badge {
+    position: absolute; left: 10px; top: 10px; padding: 3px 10px; border-radius: 20px;
+    font-size: 12px; background: rgba(0,0,0,.55); color: #bbb; backdrop-filter: blur(4px);
+  }
+  #badge.ok { color: #50c878; }
+  #badge.err { color: #e65a5a; }
+  .panel { width: 100%; max-width: 560px; background: #1b1b1b; border-radius: 12px; padding: 14px; margin-top: 14px; }
+  .row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 7px 0; }
+  .row label { color: #aaa; font-size: 14px; flex: none; }
+  select, button {
+    background: #2a2a2a; color: #e8e8e8; border: 1px solid #3a3a3a; border-radius: 8px;
+    padding: 8px 12px; font-size: 14px; min-width: 0;
+  }
+  select { flex: 1; max-width: 60%; }
+  button { cursor: pointer; }
+  button:active { background: #3a3a3a; }
+  #toggle { width: 100%; padding: 13px; font-size: 16px; font-weight: 600; background: #1f4d33; border-color: #2c6b47; color: #7ee2a8; margin-top: 10px; }
+  #toggle.off { background: #2a2a2a; border-color: #3a3a3a; color: #e8e8e8; }
+  .hint { color: #777; font-size: 12px; margin-top: 12px; max-width: 560px; text-align: center; }
+  #err { color: #e65a5a; font-size: 13px; margin-top: 10px; max-width: 560px; text-align: center; display: none; }
+  .stats { display: flex; gap: 16px; color: #888; font-size: 12px; padding-top: 8px; }
+  .stats b { color: #ccc; font-weight: 600; }
+</style>
+</head>
+<body>
+<header><b>MONITOR</b><span>手机无线取景</span></header>
+<div id="stage">
+  <video id="video" autoplay playsinline muted></video>
+  <div id="badge">未连接</div>
+</div>
+<div id="err"></div>
+<div class="panel">
+  <div class="row"><label>摄像头</label><select id="cam"></select></div>
+  <div class="row"><label>分辨率</label>
+    <select id="res">
+      <option value="640">640（省流量）</option>
+      <option value="960" selected>960（推荐）</option>
+      <option value="1280">1280（高清）</option>
+    </select>
+  </div>
+  <div class="row"><label>帧率</label>
+    <select id="fps">
+      <option value="15">15 fps</option>
+      <option value="24" selected>24 fps</option>
+      <option value="30">30 fps</option>
+    </select>
+  </div>
+  <div class="row"><label>镜像发送</label><input type="checkbox" id="mirror" style="width:22px;height:22px"></div>
+  <button id="toggle" class="off">开始发送</button>
+  <div class="stats"><span>状态 <b id="st">未连接</b></span><span>发送 <b id="sf">0</b> fps</span><span>画面 <b id="dim">—</b></span></div>
+</div>
+<p class="hint">手机与电脑需在同一 Wi-Fi。首次打开若提示证书不受信任，请选择「继续访问」。<br>保持本页面在前台且屏幕常亮，锁屏或切后台会中断发送。</p>
+<script>
+"use strict";
+const $ = id => document.getElementById(id);
+const video = $("video"), badge = $("badge"), canvas = document.createElement("canvas");
+const ctx2d = canvas.getContext("2d");
+const token = new URLSearchParams(location.search).get("t") || "";
+const ua = navigator.userAgent;
+const platform = /iPhone|iPad|iPod/.test(ua) ? "iPhone" : /Android/.test(ua) ? "Android 手机" : "手机";
+let ws = null, stream = null, sending = false, timer = null, wakeLock = null;
+let sent = 0, devices = [], camIndex = 0, reconnectDelay = 1000;
+
+function badgeSet(text, cls) { badge.textContent = text; badge.className = cls || ""; $("st").textContent = text; }
+function errShow(msg) { const e = $("err"); e.textContent = msg; e.style.display = msg ? "block" : "none"; }
+
+function deviceName() {
+  const track = stream && stream.getVideoTracks()[0];
+  const label = track && track.label ? track.label : "";
+  return label ? platform + " · " + label : platform;
+}
+
+async function listCameras() {
+  try {
+    const list = await navigator.mediaDevices.enumerateDevices();
+    devices = list.filter(d => d.kind === "videoinput");
+    const sel = $("cam");
+    sel.innerHTML = "";
+    devices.forEach((d, i) => {
+      const o = document.createElement("option");
+      o.value = i; o.textContent = d.label || ("摄像头 " + (i + 1));
+      sel.appendChild(o);
+    });
+    if (devices.length > 1) {
+      const back = devices.findIndex(d => /back|rear|environment|后置/i.test(d.label));
+      if (back >= 0) { camIndex = back; sel.value = back; }
+    }
+  } catch (e) { /* 权限未授予时忽略 */ }
+}
+
+async function openCamera() {
+  if (stream) stream.getTracks().forEach(t => t.stop());
+  const width = parseInt($("res").value, 10);
+  const video_ = { width: { ideal: width }, height: { ideal: Math.round(width * 9 / 16) } };
+  if (devices[camIndex] && devices[camIndex].deviceId) video_.deviceId = { exact: devices[camIndex].deviceId };
+  else video_.facingMode = "environment";
+  stream = await navigator.mediaDevices.getUserMedia({ video: video_, audio: false });
+  video.srcObject = stream;
+  await video.play().catch(() => {});
+  await listCameras();
+  errShow("");
+}
+
+function connect() {
+  badgeSet("连接中…");
+  ws = new WebSocket("wss://" + location.host + "/ws");
+  ws.onopen = () => {
+    reconnectDelay = 1000;
+    badgeSet("已连接", "ok");
+    ws.send(JSON.stringify({ type: "hello", name: deviceName(), token }));
+    if (sending) startLoop();
+  };
+  ws.onclose = () => {
+    badgeSet("重连中…", "err");
+    stopLoop();
+    setTimeout(connect, reconnectDelay);
+    reconnectDelay = Math.min(reconnectDelay * 1.6, 8000);
+  };
+  ws.onerror = () => { try { ws.close(); } catch (e) {} };
+}
+
+function startLoop() {
+  stopLoop();
+  const tick = () => {
+    if (!sending) return;
+    const interval = 1000 / parseInt($("fps").value, 10);
+    if (video.readyState >= 2 && video.videoWidth > 0) {
+      const w = video.videoWidth, h = video.videoHeight;
+      if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; $("dim").textContent = w + "×" + h; }
+      ctx2d.save();
+      if ($("mirror").checked) { ctx2d.translate(w, 0); ctx2d.scale(-1, 1); }
+      ctx2d.drawImage(video, 0, 0, w, h);
+      ctx2d.restore();
+      canvas.toBlob(blob => {
+        if (blob && ws && ws.readyState === 1 && ws.bufferedAmount < 1048576) {
+          ws.send(blob); sent++;
+        }
+      }, "image/jpeg", 0.8);
+    }
+    timer = setTimeout(tick, interval);
+  };
+  timer = setTimeout(tick, 60);
+}
+function stopLoop() { if (timer) { clearTimeout(timer); timer = null; } }
+
+$("toggle").onclick = async () => {
+  if (sending) {
+    sending = false; stopLoop();
+    $("toggle").textContent = "开始发送"; $("toggle").className = "off";
+    if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
+    return;
+  }
+  try {
+    if (!stream) await openCamera();
+    sending = true;
+    $("toggle").textContent = "暂停发送"; $("toggle").className = "";
+    if (ws && ws.readyState === 1) { ws.send(JSON.stringify({ type: "name", name: deviceName() })); startLoop(); }
+    try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
+  } catch (e) {
+    errShow(e && e.name === "NotAllowedError" ? "相机权限被拒绝：请在浏览器设置中允许本站访问相机后重试。"
+      : "无法打开相机：" + (e && e.message ? e.message : e));
+  }
+};
+$("cam").onchange = async () => {
+  camIndex = parseInt($("cam").value, 10) || 0;
+  try { await openCamera(); if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "name", name: deviceName() })); }
+  catch (e) { errShow("切换摄像头失败：" + e.message); }
+};
+$("res").onchange = async () => { if (stream) { try { await openCamera(); } catch (e) {} } };
+$("mirror").onchange = () => { video.style.transform = $("mirror").checked ? "scaleX(-1)" : ""; };
+setInterval(() => { $("sf").textContent = sent; sent = 0; }, 1000);
+setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); }, 5000);
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden && sending && (!timer)) startLoop();
+});
+
+(async () => {
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    errShow("此浏览器不支持相机访问，请使用 Safari / Chrome。"); return;
+  }
+  try { await openCamera(); } catch (e) {
+    errShow("等待相机权限：点「开始发送」并允许访问相机。");
+  }
+  connect();
+})();
+</script>
+</body>
+</html>

@@ -1,0 +1,162 @@
+//! ffmpeg 定位、带超时的子进程执行、MJPEG 管道帧提取。
+
+use std::io::{BufRead, BufReader};
+use std::path::PathBuf;
+use std::process::{Command, Output, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+pub fn ffmpeg_path() -> Option<PathBuf> {
+    if let Ok(p) = std::env::var("MONITOR_FFMPEG") {
+        let p = PathBuf::from(p);
+        if p.is_file() {
+            return Some(p);
+        }
+    }
+    for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"] {
+        let pb = PathBuf::from(p);
+        if pb.is_file() {
+            return Some(pb);
+        }
+    }
+    let out = Command::new("which").arg("ffmpeg").output().ok()?;
+    if out.status.success() {
+        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !s.is_empty() {
+            return Some(PathBuf::from(s));
+        }
+    }
+    None
+}
+
+/// 小输出命令的带超时执行（输出必须很小，否则管道会写满）。
+pub fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Option<Output> {
+    cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).stdin(Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(_) => return None,
+        }
+    }
+}
+
+/// 把子进程 stderr/stdout 持续读进共享缓冲（保留最后若干行，用于诊断）。
+pub fn drain_stderr<R: std::io::Read + Send + 'static>(stderr: R, sink: Arc<Mutex<Vec<String>>>) {
+    std::thread::spawn(move || {
+        let reader = BufReader::new(stderr);
+        for line in reader.lines() {
+            let Ok(line) = line else { break };
+            let line = line.trim().to_string();
+            if line.is_empty() {
+                continue;
+            }
+            if let Ok(mut s) = sink.lock() {
+                s.push(line);
+                if s.len() > 8 {
+                    s.remove(0);
+                }
+            }
+        }
+    });
+}
+
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    if hay.len() < needle.len() {
+        return None;
+    }
+    (0..=hay.len() - needle.len()).find(|&i| &hay[i..i + needle.len()] == needle)
+}
+
+const JPEG_SOI: [u8; 2] = [0xFF, 0xD8];
+const JPEG_EOI: [u8; 2] = [0xFF, 0xD9];
+
+/// 从字节流里切出完整的 JPEG（ffmpeg -f image2pipe -c:v mjpeg 的输出）。
+/// JPEG 熵编码段内 0xFF 后必为 0x00 或合法标记，FFD9 不会出现在数据中间。
+pub fn extract_jpegs(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let start = match find_subslice(buf, &JPEG_SOI) {
+            Some(i) => i,
+            None => {
+                // 保留可能是半个 SOI 的尾部
+                if buf.len() > 1 {
+                    buf.drain(..buf.len() - 1);
+                }
+                break;
+            }
+        };
+        if start > 0 {
+            buf.drain(..start);
+        }
+        match find_subslice(&buf[2..], &JPEG_EOI) {
+            Some(j) => {
+                let end = 2 + j + 2;
+                out.push(buf[..end].to_vec());
+                buf.drain(..end);
+            }
+            None => break, // 不完整，等后续字节
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_jpeg(payload: &[u8]) -> Vec<u8> {
+        let mut v = JPEG_SOI.to_vec();
+        v.extend_from_slice(payload);
+        v.extend_from_slice(&JPEG_EOI);
+        v
+    }
+
+    #[test]
+    fn extracts_complete_jpegs_and_keeps_partial() {
+        let a = fake_jpeg(b"hello");
+        let b = fake_jpeg(b"world!");
+        let mut buf = a.clone();
+        buf.extend_from_slice(&b[..4]);
+        let got = extract_jpegs(&mut buf);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], a);
+        buf.extend_from_slice(&b[4..]);
+        let got = extract_jpegs(&mut buf);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], b);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn skips_garbage_between_jpegs() {
+        let a = fake_jpeg(b"x");
+        let mut buf = b"junk".to_vec();
+        buf.extend_from_slice(&a);
+        let got = extract_jpegs(&mut buf);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], a);
+    }
+
+    #[test]
+    fn jpeg_keeps_lone_ff_tail() {
+        let mut buf = vec![0xFF];
+        assert!(extract_jpegs(&mut buf).is_empty());
+        assert_eq!(buf, vec![0xFF]);
+        buf.push(0xD8);
+        buf.extend_from_slice(b"ab");
+        buf.extend_from_slice(&JPEG_EOI);
+        let got = extract_jpegs(&mut buf);
+        assert_eq!(got.len(), 1);
+    }
+
+}
