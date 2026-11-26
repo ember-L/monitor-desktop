@@ -6,6 +6,7 @@ mod capture;
 mod devices;
 mod ffmpeg;
 mod http;
+mod proc;
 mod source;
 mod viewer;
 mod wireless;

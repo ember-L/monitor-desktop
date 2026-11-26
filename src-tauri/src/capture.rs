@@ -7,7 +7,7 @@ use image::codecs::jpeg::JpegEncoder;
 use image::{ImageFormat, RgbImage};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Stdio;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -106,7 +106,7 @@ pub fn save_photo(frame: &Frame, mirror: bool, dir: &Path) -> Result<(String, Pa
 /// 用 ffmpeg 抓视频首帧作为缩略图。
 pub fn video_thumb(path: &Path) -> Option<Thumb> {
     let ff = ffmpeg::ffmpeg_path()?;
-    let mut cmd = Command::new(ff);
+    let mut cmd = crate::proc::command(ff);
     cmd.args([
         "-hide_banner", "-loglevel", "error",
         "-ss", "0", "-i", path.to_str()?, "-frames:v", "1",
@@ -196,7 +196,7 @@ pub fn start_recording(frame: &Frame, fps: f32, dir: &Path) -> Result<Recorder, 
     let (width, height) = (frame.width & !1, frame.height & !1);
     let fps = if fps.is_finite() && fps > 1.0 { fps.round() } else { 30.0 };
 
-    let mut cmd = Command::new(ff);
+    let mut cmd = crate::proc::command(ff);
     cmd.args([
         "-hide_banner", "-loglevel", "error", "-y",
         "-f", "rawvideo", "-pix_fmt", "rgb24",

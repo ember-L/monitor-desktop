@@ -2,6 +2,7 @@
 //! （内嵌 scrcpy-server 推流 + ffmpeg 解码）、手机无线（WSS 推流）。
 //! 统一产出 **JPEG 帧**：预览走本地 MJPEG 服务，拍照直接落盘，录像时才解码为 RGB。
 
+use crate::proc;
 use crate::{android, devices, ffmpeg, wireless::Wireless};
 use std::io::Read;
 use std::net::TcpStream;
@@ -132,10 +133,10 @@ impl SourceHandle {
         if let Some(cl) = self.cleanup.take() {
             // 清理 adb 转发与设备端 server（不阻塞 UI）
             std::thread::spawn(move || {
-                let mut cmd = Command::new(&cl.adb);
+                let mut cmd = proc::command(&cl.adb);
                 cmd.args(["-s", &cl.serial, "forward", "--remove", &format!("tcp:{}", cl.port)]);
                 let _ = ffmpeg::run_with_timeout(cmd, Duration::from_secs(3));
-                let mut cmd = Command::new(&cl.adb);
+                let mut cmd = proc::command(&cl.adb);
                 cmd.args(["-s", &cl.serial, "shell", &format!("pkill -f scid={}", cl.scid)]);
                 let _ = ffmpeg::run_with_timeout(cmd, Duration::from_secs(3));
             });
@@ -231,7 +232,7 @@ fn pick_pix_fmt(ff: &std::path::Path, index: u32) -> Result<Option<&'static str>
     let candidates: [Option<&'static str>; 3] = [None, Some("uyvy422"), Some("nv12")];
     let mut last_err = String::new();
     for cand in candidates {
-        let mut cmd = Command::new(ff);
+        let mut cmd = proc::command(ff);
         cmd.args(["-hide_banner", "-loglevel", "error", "-f", "avfoundation", "-framerate", "30"]);
         if let Some(p) = cand {
             cmd.args(["-pix_fmt", p]);
@@ -280,7 +281,7 @@ pub fn spawn_camera(gen: u64, index: u32, tx: Sender<Event>) -> Result<SourceHan
     #[cfg(not(target_os = "windows"))]
     let pix_fmt = pick_pix_fmt(&ff, index)?;
 
-    let mut cmd = Command::new(ff);
+    let mut cmd = proc::command(ff);
     cmd.args(["-hide_banner", "-loglevel", "error"]);
     #[cfg(target_os = "windows")]
     cmd.args(["-f", "dshow", "-rtbufsize", "64M", "-framerate", "30"]);
@@ -328,7 +329,7 @@ pub fn spawn_android(gen: u64, serial: &str, tx: Sender<Event>) -> Result<Source
     // 1. 推送内嵌 server
     let jar = std::env::temp_dir().join(format!("monitor-scrcpy-server-{}.jar", std::process::id()));
     std::fs::write(&jar, android::SCRCPY_SERVER).map_err(|e| fail(format!("写入临时 server 失败：{e}")))?;
-    let mut cmd = Command::new(&adb);
+    let mut cmd = proc::command(&adb);
     cmd.args(["-s", serial, "push", jar.to_str().unwrap_or_default(), "/data/local/tmp/scrcpy-server.jar"]);
     let out = ffmpeg::run_with_timeout(cmd, Duration::from_secs(20)).ok_or_else(|| fail("adb push 超时".into()))?;
     if !out.status.success() {
@@ -338,7 +339,7 @@ pub fn spawn_android(gen: u64, serial: &str, tx: Sender<Event>) -> Result<Source
     // 2. 随机 scid，避免与正在运行的 scrcpy 冲突；tcp:0 让 adb 分配空闲端口
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().subsec_nanos();
     let scid = format!("{:08x}", nanos & 0x7fff_ffff);
-    let mut cmd = Command::new(&adb);
+    let mut cmd = proc::command(&adb);
     cmd.args(["-s", serial, "forward", "tcp:0", &format!("localabstract:scrcpy_{scid}")]);
     let out = ffmpeg::run_with_timeout(cmd, Duration::from_secs(5)).ok_or_else(|| fail("adb forward 超时".into()))?;
     let port: u16 = String::from_utf8_lossy(&out.stdout).trim().parse()
@@ -348,7 +349,7 @@ pub fn spawn_android(gen: u64, serial: &str, tx: Sender<Event>) -> Result<Source
     let mut handle = SourceHandle { stop: stop.clone(), children: children.clone(), threads: Mutex::new(Vec::new()), cleanup, wireless: None };
 
     // 3. 启动 server（forward 模式：server 监听等待连接）
-    let mut cmd = Command::new(&adb);
+    let mut cmd = proc::command(&adb);
     cmd.args([
         "-s", serial, "shell",
         "CLASSPATH=/data/local/tmp/scrcpy-server.jar",
@@ -398,7 +399,7 @@ pub fn spawn_android(gen: u64, serial: &str, tx: Sender<Event>) -> Result<Source
     }
 
     // 6. ffmpeg 解码 H.264 → MJPEG 管道
-    let mut cmd = Command::new(ff);
+    let mut cmd = proc::command(ff);
     cmd.args([
         "-hide_banner", "-loglevel", "error",
         "-f", "h264", "-probesize", "32", "-analyzeduration", "0",

@@ -2,7 +2,6 @@
 //! macOS 上通过 USB 连接并信任的 iPhone/iPad 也会作为采集设备出现（即「手机屏幕」信号源）。
 
 use crate::ffmpeg;
-use std::process::Command;
 use std::time::Duration;
 
 #[derive(Clone, Debug, PartialEq, serde::Serialize)]
@@ -66,7 +65,7 @@ pub fn parse_dshow(text: &str) -> Vec<AvDevice> {
 
 pub fn list_dshow() -> Vec<AvDevice> {
     let Some(ffmpeg) = ffmpeg::ffmpeg_path() else { return Vec::new() };
-    let mut cmd = Command::new(ffmpeg);
+    let mut cmd = crate::proc::command(ffmpeg);
     cmd.args(["-hide_banner", "-f", "dshow", "-list_devices", "true", "-i", "dummy"]);
     match ffmpeg::run_with_timeout(cmd, Duration::from_secs(6)) {
         Some(out) => parse_dshow(&String::from_utf8_lossy(&out.stderr)),
@@ -85,7 +84,7 @@ pub fn list_cameras() -> Vec<AvDevice> {
 
 pub fn list_avfoundation() -> Vec<AvDevice> {
     let Some(ffmpeg) = ffmpeg::ffmpeg_path() else { return Vec::new() };
-    let mut cmd = Command::new(ffmpeg);
+    let mut cmd = crate::proc::command(ffmpeg);
     cmd.args(["-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""]);
     match ffmpeg::run_with_timeout(cmd, Duration::from_secs(6)) {
         Some(out) => parse_avfoundation(&String::from_utf8_lossy(&out.stderr)),

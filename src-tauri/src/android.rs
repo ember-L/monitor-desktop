@@ -3,7 +3,6 @@
 
 use crate::ffmpeg;
 use std::path::PathBuf;
-use std::process::Command;
 use std::time::Duration;
 
 /// 内嵌的 scrcpy-server（Apache-2.0, (c) Genymobile），运行时推到设备。
@@ -42,7 +41,7 @@ pub fn adb_path() -> Option<PathBuf> {
         }
     }
     let lister = if cfg!(windows) { "where" } else { "which" };
-    if let Ok(out) = Command::new(lister).arg("adb").output() {
+    if let Ok(out) = crate::proc::command(lister).arg("adb").output() {
         if out.status.success() {
             let s = String::from_utf8_lossy(&out.stdout)
                 .lines()
@@ -83,7 +82,7 @@ pub fn parse_devices(text: &str) -> Vec<AndroidDevice> {
 
 pub fn list_devices() -> Vec<AndroidDevice> {
     let Some(adb) = adb_path() else { return Vec::new() };
-    let mut cmd = Command::new(adb);
+    let mut cmd = crate::proc::command(adb);
     cmd.args(["devices", "-l"]);
     match ffmpeg::run_with_timeout(cmd, Duration::from_secs(5)) {
         Some(out) => parse_devices(&String::from_utf8_lossy(&out.stdout)),

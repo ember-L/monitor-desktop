@@ -329,7 +329,7 @@ pub fn lan_ips() -> Vec<String> {
 /// macOS / Linux：解析 `ifconfig`。
 #[cfg(not(target_os = "windows"))]
 fn lan_ips_from_system() -> Vec<String> {
-    if let Ok(out) = std::process::Command::new("ifconfig").output() {
+    if let Ok(out) = crate::proc::command("ifconfig").output() {
         if out.status.success() {
             return lan_ips_from(&String::from_utf8_lossy(&out.stdout));
         }
@@ -340,7 +340,7 @@ fn lan_ips_from_system() -> Vec<String> {
 /// Windows：解析 `ipconfig`（中文/英文系统都带 "IPv4" 关键字）。
 #[cfg(target_os = "windows")]
 fn lan_ips_from_system() -> Vec<String> {
-    if let Ok(out) = std::process::Command::new("ipconfig").output() {
+    if let Ok(out) = crate::proc::command("ipconfig").output() {
         if out.status.success() {
             return lan_ips_from_ipconfig(&String::from_utf8_lossy(&out.stdout));
         }

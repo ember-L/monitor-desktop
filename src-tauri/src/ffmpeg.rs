@@ -66,7 +66,7 @@ pub fn ffmpeg_path() -> Option<PathBuf> {
         }
     }
     let lister = if cfg!(windows) { "where" } else { "which" };
-    let out = Command::new(lister).arg("ffmpeg").output().ok()?;
+    let out = crate::proc::command(lister).arg("ffmpeg").output().ok()?;
     if out.status.success() {
         let s = String::from_utf8_lossy(&out.stdout)
             .lines()
