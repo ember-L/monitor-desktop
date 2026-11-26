@@ -91,7 +91,7 @@ pub enum Event {
 pub fn enumerate_devices() -> DeviceLists {
     let ffmpeg_ok = ffmpeg::ffmpeg_path().is_some();
     let adb_ok = android::adb_path().is_some();
-    let av = if ffmpeg_ok { devices::list_avfoundation() } else { Vec::new() };
+    let av = if ffmpeg_ok { devices::list_cameras() } else { Vec::new() };
     let android = if adb_ok { android::list_devices() } else { Vec::new() };
     DeviceLists { av, android, ffmpeg_ok, adb_ok }
 }
@@ -222,10 +222,11 @@ fn spawn_child(cmd: &mut Command) -> std::io::Result<Child> {
     cmd.spawn()
 }
 
-/// 本机摄像头 / iPhone USB：avfoundation → MJPEG 管道。
+/// 本机摄像头 / iPhone USB：macOS 用 avfoundation、Windows 用 DirectShow → MJPEG 管道。
 
 /// 部分 macOS 摄像头不支持 avfoundation 默认的 yuv420p，
 /// 先探测一帧能否成功编码，必要时改用 uyvy422 / nv12。
+#[cfg(not(target_os = "windows"))]
 fn pick_pix_fmt(ff: &std::path::Path, index: u32) -> Result<Option<&'static str>, String> {
     let candidates: [Option<&'static str>; 3] = [None, Some("uyvy422"), Some("nv12")];
     let mut last_err = String::new();
@@ -257,23 +258,40 @@ fn pick_pix_fmt(ff: &std::path::Path, index: u32) -> Result<Option<&'static str>
 }
 
 pub fn spawn_camera(gen: u64, index: u32, tx: Sender<Event>) -> Result<SourceHandle, String> {
-    let ff = ffmpeg::ffmpeg_path().ok_or("未找到 ffmpeg，请先安装：brew install ffmpeg")?;
-    let pix_fmt = pick_pix_fmt(&ff, index)?;
+    let ff = ffmpeg::ffmpeg_path()
+        .ok_or_else(|| format!("未找到 ffmpeg{}", ffmpeg::install_hint()))?;
     let stop = Arc::new(AtomicBool::new(false));
     let children: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::new(Mutex::new(Vec::new()));
     let _ = tx.send(Event::State { gen, state: SourceState::Starting });
 
+    // Windows 的 DirectShow 用设备名（video=<名称>）定位，macOS 用索引（<索引>:none）。
+    #[cfg(target_os = "windows")]
+    let input = {
+        let name = devices::list_dshow()
+            .into_iter()
+            .find(|d| d.index == index)
+            .map(|d| d.name)
+            .ok_or_else(|| "相机已断开：请重新选择设备".to_string())?;
+        format!("video={name}")
+    };
+    #[cfg(not(target_os = "windows"))]
+    let input = format!("{index}:none");
+    #[cfg(not(target_os = "windows"))]
+    let pix_fmt = pick_pix_fmt(&ff, index)?;
+
     let mut cmd = Command::new(ff);
-    cmd.args([
-        "-hide_banner", "-loglevel", "error",
-        "-f", "avfoundation", "-framerate", "30",
-    ]);
+    cmd.args(["-hide_banner", "-loglevel", "error"]);
+    #[cfg(target_os = "windows")]
+    cmd.args(["-f", "dshow", "-rtbufsize", "64M", "-framerate", "30"]);
+    #[cfg(not(target_os = "windows"))]
+    cmd.args(["-f", "avfoundation", "-framerate", "30"]);
+    #[cfg(not(target_os = "windows"))]
     if let Some(p) = pix_fmt {
         cmd.args(["-pix_fmt", p]);
     }
     cmd.args([
-        "-i", &format!("{index}:none"),
+        "-i", &input,
         "-an", "-c:v", "mjpeg", "-q:v", "3",
         "-f", "image2pipe", "pipe:1",
     ]);
@@ -295,7 +313,8 @@ pub fn spawn_camera(gen: u64, index: u32, tx: Sender<Event>) -> Result<SourceHan
 /// Android 屏幕：adb 推 scrcpy-server → forward → H.264 → ffmpeg → MJPEG 管道。
 pub fn spawn_android(gen: u64, serial: &str, tx: Sender<Event>) -> Result<SourceHandle, String> {
     let adb = android::adb_path().ok_or("未找到 adb，请安装 Android platform-tools")?;
-    let ff = ffmpeg::ffmpeg_path().ok_or("未找到 ffmpeg，请先安装：brew install ffmpeg")?;
+    let ff = ffmpeg::ffmpeg_path()
+        .ok_or_else(|| format!("未找到 ffmpeg{}", ffmpeg::install_hint()))?;
     let stop = Arc::new(AtomicBool::new(false));
     let children: Arc<Mutex<Vec<Child>>> = Arc::new(Mutex::new(Vec::new()));
     let sink = Arc::new(Mutex::new(Vec::new()));
@@ -432,7 +451,7 @@ pub fn spawn_android(gen: u64, serial: &str, tx: Sender<Event>) -> Result<Source
 /// 手机无线：WSS 推送的 JPEG 帧 → 统一的 Frame 事件。
 pub fn spawn_wireless(gen: u64, tx: Sender<Event>, wireless: Arc<Wireless>) -> Result<SourceHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
-    let rx: Receiver<Vec<u8>> = wireless.subscribe();
+    let (rx, buffered): (Receiver<Vec<u8>>, Option<Vec<u8>>) = wireless.subscribe();
     let _ = tx.send(Event::State { gen, state: SourceState::Starting });
     let handle = SourceHandle {
         stop: stop.clone(),
@@ -444,11 +463,17 @@ pub fn spawn_wireless(gen: u64, tx: Sender<Event>, wireless: Arc<Wireless>) -> R
     let (s, t) = (stop.clone(), tx.clone());
     let reader = std::thread::spawn(move || {
         let mut live = false;
+        // 手机先连上、桌面后开源时，先交付缓冲的最新一帧，不必等下一帧。
+        let mut buffered = buffered;
         loop {
             if s.load(Ordering::SeqCst) {
                 break;
             }
-            match rx.recv_timeout(Duration::from_millis(150)) {
+            let got = match buffered.take() {
+                Some(jpeg) => Ok(jpeg),
+                None => rx.recv_timeout(Duration::from_millis(150)),
+            };
+            match got {
                 Ok(jpeg) => {
                     let Some((width, height)) = ffmpeg::jpeg_size(&jpeg) else { continue };
                     if !live {

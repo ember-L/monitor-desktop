@@ -326,6 +326,18 @@ fn pair_info(app: State<'_, Arc<App>>, preferred: Option<String>) -> PairResult 
     }
 }
 
+/// 无线配对的实时诊断：手机连没连上、页面开没开、画面推没推过来。
+#[tauri::command]
+fn pair_diag(app: State<'_, Arc<App>>) -> serde_json::Value {
+    app.wireless.diag()
+}
+
+/// 自检专用：让 WebView 里的 JS 把探测结果回传到 stdout。
+#[tauri::command]
+fn probe_report(tag: String, ok: bool, detail: String) {
+    println!("PROBE_JS tag={tag} ok={ok} detail={detail}");
+}
+
 #[tauri::command]
 fn pair_stop(app: State<'_, Arc<App>>) -> serde_json::Value {
     app.wireless.stop();
@@ -356,11 +368,25 @@ fn open_path(path: String, reveal: bool) -> Result<serde_json::Value, String> {
 }
 
 fn open_target(path: &std::path::Path, reveal: bool) -> Result<(), String> {
-    let mut cmd = std::process::Command::new("open");
-    if reveal {
-        cmd.arg("-R");
-    }
-    cmd.arg(path);
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = std::process::Command::new("explorer");
+        if reveal {
+            c.arg(format!("/select,{}", path.display()));
+        } else {
+            c.arg(path);
+        }
+        c
+    };
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = {
+        let mut c = std::process::Command::new("open");
+        if reveal {
+            c.arg("-R");
+        }
+        c.arg(path);
+        c
+    };
     cmd.status().map_err(|e| format!("无法打开：{e}"))?;
     Ok(())
 }
@@ -476,7 +502,141 @@ fn main() {
                 fps_value: 0.0,
             }) });
             app.manage(state.clone());
-            spawn_pump(state, app.handle().clone(), rx);
+            spawn_pump(state.clone(), app.handle().clone(), rx);
+            // 无界面自检：MONITOR_PROBE=1 时直接开无线配对服务并启动无线取景源，
+            // 把配对地址打到 stdout，方便用脚本/浏览器验证整条链路（不影响正常使用）。
+            if std::env::var("MONITOR_PROBE").is_ok() {
+                let info = state.wireless.ensure_started();
+                if !info.qr.is_empty() {
+                    state.viewer.set_qr(info.qr.clone());
+                }
+                println!("PROBE_URL={}", info.url);
+                println!("PROBE_TOKEN={}", info.token);
+                println!("PROBE_STREAM={}", state.viewer.url("/stream"));
+                println!("PROBE_QR={}", state.viewer.url("/qr"));
+                println!("PROBE_AVAILABLE={}", info.available);
+                let gen = {
+                    let mut core = match state.core.lock() { Ok(c) => c, Err(_) => return Ok(()) };
+                    core.gen += 1;
+                    core.current = Some(DeviceId::Wireless);
+                    core.gen
+                };
+                match source::spawn_wireless(gen, state.tx.clone(), state.wireless.clone()) {
+                    Ok(handle) => {
+                        if let Ok(mut core) = state.core.lock() {
+                            if core.gen == gen { core.source = Some(handle); }
+                        }
+                    }
+                    Err(err) => println!("PROBE_ERR={err}"),
+                }
+                // 在真实 WebView 里验证本地取景服务能不能被 fetch 到（CORS / 流式读取）。
+                let stream_url = state.viewer.url("/stream");
+                let health_url = state.viewer.url("/health");
+                let frame_url = state.viewer.url("/frame.jpg");
+                let js = r#"(function(){
+  function send(tag, ok, detail){
+    try { window.__TAURI__.core.invoke('probe_report', { tag: tag, ok: ok, detail: String(detail) }); } catch (e) {}
+  }
+  send('boot', true, location.protocol + '//' + location.host);
+  fetch('@HEALTH@', { cache: 'no-store' })
+    .then(function(r){ send('health', r.ok, 'status=' + r.status); })
+    .catch(function(e){ send('health', false, e.name + ': ' + e.message); });
+  fetch('@STREAM@', { cache: 'no-store' })
+    .then(function(r){
+      send('stream_open', r.ok, 'status=' + r.status + ' body=' + (!!r.body));
+      if (!r.body) return;
+      var rd = r.body.getReader(), chunks = 0, bytes = 0, t0 = Date.now();
+      (function loop(){
+        rd.read().then(function(x){
+          if (x.done) { send('stream_end', true, 'chunks=' + chunks + ' bytes=' + bytes); return; }
+          chunks++; bytes += x.value.length;
+          if (Date.now() - t0 > 6000) {
+            try { rd.cancel(); } catch (e) {}
+            send('stream_read', true, 'chunks=' + chunks + ' bytes=' + bytes + ' ms=' + (Date.now() - t0));
+            return;
+          }
+          loop();
+        }).catch(function(e){
+          send('stream_read', false, 'chunks=' + chunks + ' bytes=' + bytes + ' ' + e.name + ': ' + e.message);
+        });
+      })();
+    })
+    .catch(function(e){ send('stream_open', false, e.name + ': ' + e.message); });
+  setTimeout(function(){
+    fetch('@FRAME@', { cache: 'no-store' })
+      .then(function(r){ return r.arrayBuffer().then(function(b){ send('frame', r.ok, 'status=' + r.status + ' bytes=' + b.byteLength); }); })
+      .catch(function(e){ send('frame', false, e.name + ': ' + e.message); });
+  }, 2500);
+  setTimeout(function(){
+    var se = document.getElementById('stage-empty');
+    var fps = document.getElementById('hud-fps');
+    var st = document.getElementById('status-text');
+    send('ui', !!(se && se.hidden), 'stageEmptyHidden=' + (!!(se && se.hidden)) + ' fps=' + (fps ? fps.textContent : '?') + ' status=' + (st ? st.textContent : '?'));
+  }, 24000);
+  // 放大取景：点一下按钮，确认真实 WKWebView 里布局铺满、并且窗口进了系统全屏。
+  setTimeout(function(){
+    var btn = document.getElementById('btn-zoom');
+    if (!btn) { send('zoom', false, 'no #btn-zoom'); return; }
+    btn.click();
+    setTimeout(function(){
+      var app = document.getElementById('app');
+      var r = document.getElementById('stage').getBoundingClientRect();
+      var on = !!(app && app.classList.contains('is-immersive'));
+      var api = window.__TAURI__ && window.__TAURI__.window;
+      var full = api && api.getCurrentWindow ? api.getCurrentWindow().isFullscreen() : 'n/a';
+      Promise.resolve(full).then(function(f){
+        send('zoom', on && Math.abs(r.width - innerWidth) < 2, 'immersive=' + on + ' stage=' + Math.round(r.width) + 'x' + Math.round(r.height) + ' win=' + innerWidth + 'x' + innerHeight + ' fullscreen=' + f);
+        btn.click();
+      }).catch(function(e){ send('zoom', false, 'err ' + e); });
+    }, 1500);
+  }, 5000);
+  // 轮询通道：连续取 40 次单帧，统计成功率与解码成功率（模拟新的桌面端取帧方式）。
+  setTimeout(function(){
+    var ok = 0, miss = 0, decoded = 0, fail = 0, firstErr = '', t0 = Date.now();
+    var url = '@FRAME@';
+    (function poll(n){
+      if (n <= 0) {
+        send('poll', fail === 0 && decoded > 0, 'ok=' + ok + ' 404=' + miss + ' decoded=' + decoded + ' fail=' + fail + ' ms=' + (Date.now() - t0) + ' ' + firstErr);
+        return;
+      }
+      fetch(url + '?t=' + Date.now(), { cache: 'no-store' })
+        .then(function(r){
+          if (r.status === 404) { miss++; return null; }
+          if (!r.ok) { fail++; firstErr = 'status ' + r.status; return null; }
+          return r.arrayBuffer().then(function(b){
+            ok++;
+            return window.createImageBitmap(new Blob([b], { type: 'image/jpeg' })).then(function(bm){ decoded++; bm.close(); }).catch(function(e){ firstErr = 'decode ' + e.name; });
+          });
+        })
+        .catch(function(e){ fail++; if (!firstErr) firstErr = e.name + ': ' + e.message; })
+        .then(function(){ setTimeout(function(){ poll(n - 1); }, 40); });
+    })(40);
+  }, 3000);
+})();"#
+                    .replace("@HEALTH@", &health_url)
+                    .replace("@STREAM@", &stream_url)
+                    .replace("@FRAME@", &frame_url);
+                let win = app.get_webview_window("main");
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(8));
+                    match win {
+                        Some(w) => {
+                            println!("PROBE_JS_RUN={}", js.len());
+                            if let Err(err) = w.eval(&js) {
+                                println!("PROBE_JS_ERR={err}");
+                            }
+                        }
+                        None => println!("PROBE_JS_ERR=no main window"),
+                    }
+                });
+                // 让真实界面自己走一遍：模拟手机连上来 → 界面选源 → 拉流。
+                let handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_secs(12));
+                    let _ = handle.emit("wireless", serde_json::json!({ "connected": true, "name": "probe", "hint": "" }));
+                    println!("PROBE_EMIT=wireless");
+                });
+            }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -489,6 +649,8 @@ fn main() {
             stop_recording,
             recording_status,
             pair_info,
+            pair_diag,
+            probe_report,
             pair_stop,
             open_path,
             open_captures_dir,

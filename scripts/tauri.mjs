@@ -3,7 +3,7 @@
 // 直接跑 tauri CLI 会报 `failed to run cargo metadata ... No such file or directory`。
 // 这里先探测 Rust 工具链，把它的 bin 目录注入 PATH，再原样转交参数给 @tauri-apps/cli。
 import { spawn } from 'node:child_process'
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, readdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -11,10 +11,14 @@ import { fileURLToPath } from 'node:url'
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 const home = process.env.HOME || homedir()
 
+const isWin = process.platform === 'win32'
+
 function isExec(file) {
   try {
     const st = statSync(file)
-    return st.isFile() && (st.mode & 0o111) !== 0
+    if (!st.isFile()) return false
+    // Windows 上可执行位不可靠，能读到文件就算可执行
+    return isWin || (st.mode & 0o111) !== 0
   } catch {
     return false
   }
@@ -36,14 +40,15 @@ function toolchainBins() {
 
 function findCargo() {
   const candidates = []
+  const exe = isWin ? 'cargo.exe' : 'cargo'
   if (process.env.MONITOR_CARGO) candidates.push(process.env.MONITOR_CARGO)
   for (const dir of (process.env.PATH || '').split(path.delimiter)) {
-    if (dir) candidates.push(path.join(dir, 'cargo'))
+    if (dir) candidates.push(path.join(dir, exe))
   }
-  if (process.env.CARGO_HOME) candidates.push(path.join(process.env.CARGO_HOME, 'bin', 'cargo'))
-  candidates.push(path.join(home, '.cargo', 'bin', 'cargo'))
-  candidates.push(path.join(root, '.rust', 'cargo', 'bin', 'cargo'))
-  for (const bin of toolchainBins()) candidates.push(path.join(bin, 'cargo'))
+  if (process.env.CARGO_HOME) candidates.push(path.join(process.env.CARGO_HOME, 'bin', exe))
+  candidates.push(path.join(home, '.cargo', 'bin', exe))
+  candidates.push(path.join(root, '.rust', 'cargo', 'bin', exe))
+  for (const bin of toolchainBins()) candidates.push(path.join(bin, exe))
   for (const file of candidates) {
     if (file && isExec(file)) return file
   }
@@ -73,14 +78,26 @@ if (process.env.MONITOR_PRINT_TOOLCHAIN) {
   console.error('[monitor] PATH+: ' + binDir)
 }
 
-const cli = path.join(root, 'node_modules', '.bin', 'tauri')
+// 直接跑 @tauri-apps/cli 的入口脚本：node_modules/.bin 在 Windows 上是 .cmd，
+// 用 spawn 直接执行会失败（ENOENT），统一交给当前 node 进程执行最稳。
+const cliPkg = path.join(root, 'node_modules', '@tauri-apps', 'cli', 'package.json')
+let cli = path.join(root, 'node_modules', '.bin', 'tauri')
+if (existsSync(cliPkg)) {
+  try {
+    const pkg = JSON.parse(readFileSync(cliPkg, 'utf8'))
+    const bin = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin && pkg.bin.tauri
+    if (bin) cli = path.join(path.dirname(cliPkg), bin)
+  } catch {
+    // package.json 读不出来就退回 .bin/tauri
+  }
+}
 if (!existsSync(cli)) {
   console.error('未找到 Tauri CLI，请先安装依赖：pnpm install')
   process.exit(1)
 }
 
 const args = process.argv.slice(2)
-const child = spawn(cli, args, { env, stdio: 'inherit' })
+const child = spawn(process.execPath, [cli, ...args], { env, stdio: 'inherit' })
 child.on('error', (err) => {
   console.error('无法启动 Tauri CLI：' + err.message)
   process.exit(1)

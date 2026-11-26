@@ -13,6 +13,9 @@ use std::time::Duration;
 
 const PHONE_PAGE: &str = include_str!("phone_page.html");
 
+/// 单条连接最多处理的请求数（逐帧上行会长期复用同一条连接）。
+const MAX_REQUESTS_PER_CONN: usize = 8192;
+
 /// 配对信息（前端展示二维码与地址）。
 #[derive(Clone, Serialize)]
 pub struct PairInfo {
@@ -28,9 +31,35 @@ pub struct PairInfo {
     pub qr: Vec<u8>,
 }
 
+/// 连接诊断计数：界面据此区分「手机没连上」和「连上了没推流」。
+#[derive(Default)]
+struct Diag {
+    accepts: u64,
+    requests: u64,
+    page_loads: u64,
+    frame_posts: u64,
+    ws_frames: u64,
+    bytes: u64,
+    errors: u64,
+    last_peer: String,
+    last_request: String,
+    last_error: String,
+    last_at: String,
+}
+
+fn now_stamp() -> String {
+    chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
 pub struct Wireless {
     tx: Sender<Event>,
     sink: Mutex<Option<Sender<Vec<u8>>>>,
+    /// 没有订阅者时保留的最新一帧（手机先连上、桌面后开源时立刻有画面）。
+    latest: Mutex<Option<Vec<u8>>>,
+    /// 本机自签证书 DER，供手机从 /cert 下载安装。
+    cert: Mutex<Vec<u8>>,
+    /// 连接与请求计数（诊断用，不含画面内容）。
+    diag: Mutex<Diag>,
     info: Mutex<Option<PairInfo>>,
     connected: Mutex<Option<String>>,
     stop: Arc<AtomicBool>,
@@ -42,6 +71,9 @@ impl Wireless {
         Arc::new(Self {
             tx,
             sink: Mutex::new(None),
+            latest: Mutex::new(None),
+            cert: Mutex::new(Vec::new()),
+            diag: Mutex::new(Diag::default()),
             info: Mutex::new(None),
             connected: Mutex::new(None),
             stop: Arc::new(AtomicBool::new(false)),
@@ -98,10 +130,13 @@ impl Wireless {
             return Self::unavailable("未连接局域网，请接入 Wi-Fi 或有线网络后重试".into());
         };
         let token = random_token();
-        let config = match tls_config(&lan) {
+        let (config, cert_der) = match tls_config(&lan) {
             Ok(c) => c,
             Err(e) => return Self::unavailable(format!("生成自签证书失败：{e}")),
         };
+        if let Ok(mut c) = self.cert.lock() {
+            *c = cert_der;
+        }
         let listener = match TcpListener::bind(("0.0.0.0", 0)) {
             Ok(l) => l,
             Err(e) => return Self::unavailable(format!("无法监听无线端口：{e}")),
@@ -196,26 +231,65 @@ impl Wireless {
         updated
     }
 
-    pub fn subscribe(&self) -> Receiver<Vec<u8>> {
+    /// 订阅帧。之前没有订阅者时，把缓冲的最新一帧一并返回，桌面立刻能出画面。
+    pub fn subscribe(&self) -> (Receiver<Vec<u8>>, Option<Vec<u8>>) {
         let (tx, rx) = channel();
+        let pending = self.latest.lock().ok().and_then(|mut l| l.take());
         if let Ok(mut sink) = self.sink.lock() {
             *sink = Some(tx);
         }
-        rx
+        (rx, pending)
     }
 
     pub fn clear_sink(&self) {
         if let Ok(mut sink) = self.sink.lock() {
             *sink = None;
         }
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = None;
+        }
     }
 
-    fn push_frame(&self, data: Vec<u8>) {
-        if let Ok(sink) = self.sink.lock() {
+    fn push_frame(&self, mut data: Vec<u8>) {
+        if let Ok(mut sink) = self.sink.lock() {
             if let Some(tx) = sink.as_ref() {
-                let _ = tx.send(data);
+                match tx.send(data) {
+                    Ok(()) => return,
+                    Err(err) => {
+                        // 订阅者已退出：清掉 sink，退化为缓冲最新帧。
+                        *sink = None;
+                        data = err.0;
+                    }
+                }
             }
         }
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = Some(data);
+        }
+    }
+
+    /// 逐帧 POST 上行没有握手，第一帧到达即视为手机上线。
+    fn mark_connected(&self, name: Option<&str>) {
+        let name = name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+        let changed = match self.connected.lock() {
+            Ok(mut c) => {
+                if c.is_some() && name.is_none() {
+                    false
+                } else {
+                    *c = name.clone();
+                    true
+                }
+            }
+            Err(_) => false,
+        };
+        if changed {
+            let _ = self.tx.send(Event::Wireless { connected: true, name, hint: None });
+        }
+    }
+
+    fn mark_disconnected(&self, hint: Option<String>) {
+        let name = self.connected.lock().ok().and_then(|mut c| c.take());
+        let _ = self.tx.send(Event::Wireless { connected: false, name, hint });
     }
 
     fn token(&self) -> String {
@@ -223,7 +297,7 @@ impl Wireless {
     }
 }
 
-fn tls_config(lan: &str) -> Result<Arc<rustls::ServerConfig>, String> {
+fn tls_config(lan: &str) -> Result<(Arc<rustls::ServerConfig>, Vec<u8>), String> {
     let _ = rustls::crypto::ring::default_provider().install_default();
     let key_pair = rcgen::KeyPair::generate().map_err(|e| e.to_string())?;
     let mut params = rcgen::CertificateParams::new(vec![lan.to_string(), "localhost".to_string()])
@@ -238,25 +312,64 @@ fn tls_config(lan: &str) -> Result<Arc<rustls::ServerConfig>, String> {
         .with_no_client_auth()
         .with_single_cert(certs, key)
         .map_err(|e| e.to_string())?;
-    Ok(Arc::new(config))
+    // 同一份证书也用于 /cert 下载：手机安装信任后 WSS 不再被拦。
+    Ok((Arc::new(config), cert.der().to_vec()))
 }
 
-/// 本机候选局域网 IPv4 地址（Wi‑Fi `en0` 优先）。只取 `ifconfig` 里的私有/普通地址，
-/// 排除回环、链路本地与 VPN（utun）、AWDL 等手机不可达的接口。
+/// 本机候选局域网 IPv4 地址（Wi‑Fi 优先）。只取系统网卡里的私有/普通地址，
+/// 排除回环、链路本地与 VPN、AWDL 等手机不可达的接口。
 pub fn lan_ips() -> Vec<String> {
-    if let Ok(out) = std::process::Command::new("ifconfig").output() {
-        if out.status.success() {
-            let list = lan_ips_from(&String::from_utf8_lossy(&out.stdout));
-            if !list.is_empty() {
-                return list;
-            }
-        }
+    let list = lan_ips_from_system();
+    if !list.is_empty() {
+        return list;
     }
     udp_lan_ip().into_iter().collect()
 }
 
+/// macOS / Linux：解析 `ifconfig`。
+#[cfg(not(target_os = "windows"))]
+fn lan_ips_from_system() -> Vec<String> {
+    if let Ok(out) = std::process::Command::new("ifconfig").output() {
+        if out.status.success() {
+            return lan_ips_from(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    Vec::new()
+}
+
+/// Windows：解析 `ipconfig`（中文/英文系统都带 "IPv4" 关键字）。
+#[cfg(target_os = "windows")]
+fn lan_ips_from_system() -> Vec<String> {
+    if let Ok(out) = std::process::Command::new("ipconfig").output() {
+        if out.status.success() {
+            return lan_ips_from_ipconfig(&String::from_utf8_lossy(&out.stdout));
+        }
+    }
+    Vec::new()
+}
+
+/// 形如 `IPv4 地址 . . . . . . . . : 192.168.1.7` 或 `IPv4 Address. . . : 10.0.0.23(Preferred)`。
+#[cfg(target_os = "windows")]
+fn lan_ips_from_ipconfig(text: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in text.lines() {
+        if !line.contains("IPv4") {
+            continue;
+        }
+        let Some((_, rest)) = line.rsplit_once(':') else { continue };
+        let token = rest.trim();
+        let ip = token.split('(').next().unwrap_or("").trim();
+        if is_lan_v4(ip) && !found.iter().any(|s| s == ip) {
+            found.push(ip.to_string());
+        }
+    }
+    found
+}
+
+#[cfg(not(target_os = "windows"))]
 const SKIP_IFACE: [&str; 8] = ["lo", "utun", "awdl", "llw", "gif", "stf", "ap", "anpi"];
 
+#[cfg(not(target_os = "windows"))]
 fn lan_ips_from(text: &str) -> Vec<String> {
     let mut found: Vec<(u8, String, String)> = Vec::new();
     let mut iface = String::new();
@@ -318,17 +431,29 @@ fn udp_lan_ip() -> Option<String> {
 }
 
 fn random_token() -> String {
-    use std::io::Read;
-    let mut bytes = [0u8; 8];
-    if std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut bytes)).is_ok() {
-        bytes.iter().map(|b| format!("{b:02x}")).collect()
-    } else {
-        let n = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        format!("{n:x}")
+    use std::hash::{Hash, Hasher};
+    // Unix 上直接读内核随机数；Windows 没有 /dev/urandom，用时间 + 进程 + 地址混合。
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::io::Read;
+        let mut bytes = [0u8; 8];
+        if std::fs::File::open("/dev/urandom")
+            .and_then(|mut f| f.read_exact(&mut bytes))
+            .is_ok()
+        {
+            return bytes.iter().map(|b| format!("{b:02x}")).collect();
+        }
     }
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    nanos.hash(&mut h);
+    std::process::id().hash(&mut h);
+    (&nanos as *const u128 as usize).hash(&mut h);
+    let v = h.finish();
+    format!("{nanos:016x}{v:016x}").chars().take(16).collect()
 }
 
 fn make_qr_png(url: &str) -> Option<Vec<u8>> {
@@ -344,57 +469,239 @@ fn make_qr_png(url: &str) -> Option<Vec<u8>> {
     Some(png)
 }
 
+/// 配对/连接诊断日志：写 ~/Library/Logs/MONITOR/wireless.log，写不进去时退到 /tmp/monitor-wireless.log。
+/// 只记连接与请求行（不含 token），不记录画面内容。
+fn trace(line: &str) {
+    #[cfg(debug_assertions)]
+    eprintln!("[wireless] {line}");
+    let line = format!("{} {line}", now_stamp());
+    let mut done = false;
+    if let Some(home) = std::env::var_os("HOME") {
+        let dir = std::path::PathBuf::from(home).join("Library/Logs/MONITOR");
+        let _ = std::fs::create_dir_all(&dir);
+        done = append_log(&dir.join("wireless.log"), &line);
+    }
+    if !done {
+        let _ = append_log(std::path::Path::new("/tmp/monitor-wireless.log"), &line);
+    }
+}
+
+/// 追加一行；文件超过 512KB 先删掉重来。写入成功返回 true。
+fn append_log(path: &std::path::Path, line: &str) -> bool {
+    use std::io::Write;
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > 512 * 1024 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    match std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        Ok(mut f) => f.write_all(format!("{line}\n").as_bytes()).is_ok(),
+        Err(_) => false,
+    }
+}
+
+impl Wireless {
+    fn with_diag(&self, f: impl FnOnce(&mut Diag)) {
+        if let Ok(mut d) = self.diag.lock() {
+            f(&mut d);
+        }
+    }
+
+    fn note_accept(&self, peer: &str) {
+        self.with_diag(|d| {
+            d.accepts += 1;
+            d.last_peer = peer.to_string();
+            d.last_at = now_stamp();
+        });
+    }
+
+    fn note_request(&self, method: &str, path: &str) {
+        self.with_diag(|d| {
+            d.requests += 1;
+            d.last_request = format!("{method} {path}");
+            d.last_at = now_stamp();
+        });
+    }
+
+    fn note_page_load(&self) {
+        self.with_diag(|d| d.page_loads += 1);
+    }
+
+    fn note_frame(&self, bytes: usize, ws: bool) {
+        self.with_diag(|d| {
+            if ws {
+                d.ws_frames += 1;
+            } else {
+                d.frame_posts += 1;
+            }
+            d.bytes += bytes as u64;
+        });
+    }
+
+    fn note_error(&self, msg: &str) {
+        self.with_diag(|d| {
+            d.errors += 1;
+            d.last_error = msg.to_string();
+        });
+        trace(&format!("error: {msg}"));
+    }
+
+    /// 给界面看的实时诊断：手机连没连上、页面开没开、画面推没推过来。
+    pub fn diag(&self) -> serde_json::Value {
+        let guard = self.diag.lock().ok();
+        let fallback = Diag::default();
+        let d = guard.as_deref().unwrap_or(&fallback);
+        let connected = self.connected.lock().ok().and_then(|c| c.clone());
+        let buffered = self.latest.lock().map(|l| l.is_some()).unwrap_or(false);
+        serde_json::json!({
+            "connected": connected.is_some(),
+            "connectedName": connected,
+            "hasFrame": d.frame_posts + d.ws_frames > 0,
+            "buffered": buffered,
+            "accepts": d.accepts,
+            "requests": d.requests,
+            "pageLoads": d.page_loads,
+            "framePosts": d.frame_posts,
+            "wsFrames": d.ws_frames,
+            "bytes": d.bytes,
+            "errors": d.errors,
+            "lastPeer": d.last_peer,
+            "lastRequest": d.last_request,
+            "lastError": d.last_error,
+            "lastAt": d.last_at,
+        })
+    }
+}
+
 fn serve_conn(w: Arc<Wireless>, cfg: Arc<rustls::ServerConfig>, stream: TcpStream) {
+    let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".to_string());
+    trace(&format!("accept {peer}"));
+    w.note_accept(&peer);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let Ok(conn) = rustls::ServerConnection::new(cfg) else { return };
     let tls = rustls::StreamOwned::new(conn, stream);
     let mut rd = BufReader::new(tls);
-    let req = match http::read_request(&mut rd) {
-        Ok(r) => r,
-        Err(_) => return,
-    };
-    let path = req.path.clone();
-
-    if path == "/ws" && req.is_websocket_upgrade() {
-        let Some(key) = req.header("sec-websocket-key").map(|s| s.to_string()) else {
-            let _ = http::write_status(rd.get_mut(), 400, "Bad Request");
-            return;
+    // 一条 TLS 连接上连续处理多个请求：手机用 POST /frame 逐帧上行时复用它，
+    // 避免每帧重新握手（这也是 WSS 被拦时的兜底通道）。
+    let mut served: u32 = 0;
+    for _ in 0..MAX_REQUESTS_PER_CONN {
+        let req = match http::read_request(&mut rd) {
+            Ok(r) => r,
+            Err(e) => {
+                trace(&format!("{peer} closed after {served} requests: {e}"));
+                return;
+            }
         };
-        let resp = format!(
-            "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
-            http::ws_accept_key(&key)
-        );
-        if rd.get_mut().write_all(resp.as_bytes()).is_err() {
-            return;
+        let path = req.path.clone();
+        served += 1;
+        w.note_request(&req.method, &path);
+        if served <= 2 {
+            trace(&format!("{peer} {} {path}", req.method));
         }
-        let _ = rd.get_mut().flush();
-        ws_loop(w, WsConn::with_reader(rd));
-        return;
-    }
 
-    // 手机页与图标：需要正确配对 token
-    if path == "/" || path == "/index.html" {
-        let token_ok = req.query_param("t").as_deref() == Some(w.token().as_str());
-        if !token_ok {
-            let _ = http::write_response(
-                rd.get_mut(),
-                403,
-                "Forbidden",
-                "text/html; charset=utf-8",
-                &[],
-                "<!doctype html><meta charset=utf-8><body style='font:16px -apple-system;background:#08090A;color:#E9EBE4;padding:40px'>配对码无效，请重新扫描电脑上的二维码。</body>".as_bytes(),
+        if path == "/ws" && req.is_websocket_upgrade() {
+            let Some(key) = req.header("sec-websocket-key").map(|s| s.to_string()) else {
+                let _ = http::write_status(rd.get_mut(), 400, "Bad Request");
+                return;
+            };
+            let resp = format!(
+                "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {}\r\n\r\n",
+                http::ws_accept_key(&key)
             );
+            if rd.get_mut().write_all(resp.as_bytes()).is_err() {
+                return;
+            }
+            let _ = rd.get_mut().flush();
+            ws_loop(w, WsConn::with_reader(rd));
             return;
         }
-        let _ = http::write_response(rd.get_mut(), 200, "OK", "text/html; charset=utf-8", &[], PHONE_PAGE.as_bytes());
+
+        // 逐帧上行兜底：WSS 因证书/网络环境被拦时，手机改用同源 HTTPS POST 推帧。
+        if path == "/frame" && req.method == "POST" {
+            if req.query_param("t").as_deref() != Some(w.token().as_str()) {
+                w.note_error("配对码无效：手机推流被拒");
+                let _ = http::write_status(rd.get_mut(), 403, "Forbidden");
+                return;
+            }
+            let body = match http::read_body(&mut rd, http::content_length(&req)) {
+                Ok(b) => b,
+                Err(_) => return,
+            };
+            if body.len() < 4 || body[0] != 0xFF || body[1] != 0xD8 {
+                let _ = http::write_status(rd.get_mut(), 400, "Bad Request");
+                return;
+            }
+            let name = req.query_param("name");
+            let len = body.len();
+            w.mark_connected(name.as_deref());
+            w.push_frame(body);
+            w.note_frame(len, false);
+            if http::write_response_keep_alive(rd.get_mut(), 204, "No Content", "text/plain; charset=utf-8", b"").is_err() {
+                return;
+            }
+            continue;
+        }
+
+        // 手机离开页面：撤销「已连接」，让界面回到等待扫码。
+        if path == "/bye" {
+            if req.query_param("t").as_deref() != Some(w.token().as_str()) {
+                let _ = http::write_status(rd.get_mut(), 403, "Forbidden");
+                return;
+            }
+            w.mark_disconnected(Some("手机已断开连接".into()));
+            let _ = http::write_response_keep_alive(rd.get_mut(), 204, "No Content", "text/plain; charset=utf-8", b"");
+            continue;
+        }
+
+        // 手机页与图标：需要正确配对 token
+        if path == "/" || path == "/index.html" {
+            let token_ok = req.query_param("t").as_deref() == Some(w.token().as_str());
+            if !token_ok {
+                w.note_error("配对码无效：手机打开的是旧二维码地址");
+                let _ = http::write_response(
+                    rd.get_mut(),
+                    403,
+                    "Forbidden",
+                    "text/html; charset=utf-8",
+                    &[],
+                    "<!doctype html><meta charset=utf-8><body style='font:16px -apple-system;background:#08090A;color:#E9EBE4;padding:40px'>配对码无效，请重新扫描电脑上的二维码。</body>".as_bytes(),
+                );
+                return;
+            }
+            // keep-alive：手机页之后的同源取帧请求可以复用这条连接。
+            let _ = http::write_response_keep_alive(rd.get_mut(), 200, "OK", "text/html; charset=utf-8", PHONE_PAGE.as_bytes());
+            w.note_page_load();
+            continue;
+        }
+
+        // 证书下载：手机安装并信任后，WSS 不再被拦。
+        if path == "/cert" {
+            let der = w.cert.lock().map(|c| c.clone()).unwrap_or_default();
+            if der.is_empty() {
+                let _ = http::write_status(rd.get_mut(), 404, "Not Found");
+                return;
+            }
+            let headers: Vec<(&str, String)> = vec![
+                ("Content-Type", "application/x-x509-ca-cert".to_string()),
+                ("Content-Length", der.len().to_string()),
+                ("Content-Disposition", "attachment; filename=\"monitor.crt\"".to_string()),
+                ("Cache-Control", "no-store".to_string()),
+                ("Connection", "close".to_string()),
+            ];
+            let _ = http::write_head(rd.get_mut(), 200, "OK", &headers);
+            let _ = rd.get_mut().write_all(&der);
+            let _ = rd.get_mut().flush();
+            return;
+        }
+
+        if path == "/favicon.ico" {
+            let _ = http::write_status(rd.get_mut(), 204, "No Content");
+            return;
+        }
+        let _ = http::write_status(rd.get_mut(), 404, "Not Found");
         return;
     }
-    if path == "/favicon.ico" {
-        let _ = http::write_status(rd.get_mut(), 204, "No Content");
-        return;
-    }
-    let _ = http::write_status(rd.get_mut(), 404, "Not Found");
 }
 
 fn ws_loop(w: Arc<Wireless>, mut ws: WsConn<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>) {
@@ -408,7 +715,9 @@ fn ws_loop(w: Arc<Wireless>, mut ws: WsConn<rustls::StreamOwned<rustls::ServerCo
         match msg {
             WsMsg::Binary(data) => {
                 if authed {
+                    let len = data.len();
                     w.push_frame(data);
+                    w.note_frame(len, true);
                 }
             }
             WsMsg::Text(text) => {
@@ -417,6 +726,7 @@ fn ws_loop(w: Arc<Wireless>, mut ws: WsConn<rustls::StreamOwned<rustls::ServerCo
                     Some("hello") => {
                         let token = v.get("token").and_then(|t| t.as_str()).unwrap_or_default();
                         if token.is_empty() || token != w.token() {
+                            w.note_error("配对码无效：手机 WSS 握手被拒");
                             let _ = ws.write_text("{\"type\":\"error\",\"message\":\"配对码无效\"}");
                             break;
                         }
@@ -473,6 +783,23 @@ mod tests {
         assert_ne!(t, random_token());
     }
 
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn parses_ipconfig_addresses() {
+        let text = "以太网适配器 以太网:
+
+   连接特定的 DNS 后缀 . . . . . . . :
+   IPv4 地址 . . . . . . . . . . . . : 192.168.31.7
+   子网掩码  . . . . . . . . . . . . : 255.255.255.0
+
+无线局域网适配器 WLAN:
+   IPv4 Address. . . . . . . . . . . : 10.0.0.23(Preferred)
+   IPv4 地址 . . . . . . . . . . . . : 127.0.0.1";
+        let ips = lan_ips_from_ipconfig(text);
+        assert_eq!(ips, vec!["192.168.31.7".to_string(), "10.0.0.23".to_string()]);
+    }
+
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn lan_ips_prefer_wifi_and_skip_vpn() {
         let sample = "lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n\tinet 127.0.0.1 netmask 0xff000000\nen0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 192.168.31.24 netmask 0xffffff00 broadcast 192.168.31.255\nen1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n\tinet 10.0.0.7 netmask 0xffff0000 broadcast 10.0.255.255\nutun3: flags=8051<UP,POINTOPOINT,RUNNING,MULTICAST> mtu 1380\n\tinet 10.8.0.2 --> 10.8.0.2 netmask 0xffffffff\n";
@@ -607,7 +934,8 @@ mod tests {
             eprintln!("跳过：无线服务不可用（{}）", info.hint);
             return;
         }
-        let frames = w.subscribe();
+        let (frames, pending) = w.subscribe();
+        assert!(pending.is_none(), "还没有帧时不应有缓冲帧");
 
         // 1. 手机页：正确 token 返回 HTML，错误 token 返回 403
         let mut rd = connect(info.port);
@@ -661,6 +989,122 @@ mod tests {
             }
         }
         assert!(connected, "应收到手机上线事件");
+        w.clear_sink();
+    }
+
+    /// 兜底通道：WSS 握手失败时手机改用 HTTPS POST 逐帧推流（同一连接复用）。
+    #[test]
+    fn accepts_post_frames_and_serves_certificate() {
+        let (tx, events) = channel();
+        let w = Wireless::new(tx);
+        let info = w.ensure_started();
+        if !info.available {
+            eprintln!("跳过：无线服务不可用（{}）", info.hint);
+            return;
+        }
+        let (frames, pending) = w.subscribe();
+        assert!(pending.is_none());
+
+        let mut rd = connect(info.port);
+        let frame = vec![0xFF, 0xD8, 0x33, 0x44, 0xFF, 0xD9];
+        let post = |rd: &mut std::io::BufReader<rustls::StreamOwned<rustls::ClientConnection, TcpStream>>, body: &[u8]| {
+            let head = format!(
+                "POST /frame?t={}&name=%E6%B5%8B%E8%AF%95%E6%89%8B%E6%9C%BA HTTP/1.1\r\nHost: {}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                info.token, info.lan, body.len()
+            );
+            rd.get_mut().write_all(head.as_bytes()).unwrap();
+            rd.get_mut().write_all(body).unwrap();
+            read_head(rd)
+        };
+        let resp = post(&mut rd, &frame);
+        assert!(resp.starts_with("HTTP/1.1 204"), "POST /frame 应返回 204：{resp}");
+        assert_eq!(frames.recv_timeout(Duration::from_secs(3)).expect("应收到 POST 帧"), frame);
+
+        // 同一条连接再推一帧：keep-alive 生效
+        let frame2 = vec![0xFF, 0xD8, 0x55, 0x66, 0xFF, 0xD9];
+        let resp2 = post(&mut rd, &frame2);
+        assert!(resp2.starts_with("HTTP/1.1 204"), "复用连接的第二帧应被接受：{resp2}");
+        assert_eq!(frames.recv_timeout(Duration::from_secs(3)).expect("应收到第二帧"), frame2);
+
+        // 诊断计数：界面靠它区分「没连上」和「连上了没推流」
+        let d = w.diag();
+        assert_eq!(d["framePosts"], 2, "应记到两帧：{d}");
+        assert_eq!(d["connected"], true, "应记为已连接：{d}");
+        assert_eq!(d["hasFrame"], true, "应记录收到过帧：{d}");
+        assert_eq!(d["lastRequest"], "POST /frame", "应记到最近一次请求：{d}");
+
+        // 错误 token 被拒绝
+        let mut bad = connect(info.port);
+        bad.get_mut()
+            .write_all(b"POST /frame?t=nope HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\n\xff\xd8\x00\x00")
+            .unwrap();
+        assert!(read_head(&mut bad).starts_with("HTTP/1.1 403"), "错误 token 的 POST 应被拒绝");
+
+        // 第一帧到达即触发上线事件
+        let mut connected = false;
+        for _ in 0..20 {
+            match events.recv_timeout(Duration::from_millis(100)) {
+                Ok(Event::Wireless { connected: true, .. }) => {
+                    connected = true;
+                    break;
+                }
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(connected, "POST 帧应触发手机上线事件");
+
+        // 证书下载
+        let mut rd = connect(info.port);
+        let req = format!("GET /cert HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n", info.lan);
+        rd.get_mut().write_all(req.as_bytes()).unwrap();
+        let head = read_head(&mut rd);
+        assert!(head.starts_with("HTTP/1.1 200"), "证书应可下载：{head}");
+        assert!(head.to_ascii_lowercase().contains("application/x-x509-ca-cert"), "证书类型不对：{head}");
+        let der = read_body(&mut rd, &head);
+        assert_eq!(&der[..1], &[0x30], "DER 证书应以 SEQUENCE 开头");
+        w.clear_sink();
+    }
+
+    /// 手机先连上、桌面后开源：缓冲的最新一帧要立刻交给新订阅者。
+    #[test]
+    fn keeps_latest_frame_for_late_subscribers() {
+        let (tx, _rx) = channel();
+        let w = Wireless::new(tx);
+        w.push_frame(vec![0xFF, 0xD8, 0x01, 0x02, 0xFF, 0xD9]);
+        w.push_frame(vec![0xFF, 0xD8, 0x03, 0x04, 0xFF, 0xD9]);
+        let (_frames, pending) = w.subscribe();
+        assert_eq!(pending.expect("应缓冲最新一帧"), vec![0xFF, 0xD8, 0x03, 0x04, 0xFF, 0xD9]);
+        let (_second, none) = w.subscribe();
+        assert!(none.is_none(), "缓冲帧只交付一次");
+    }
+
+    /// 持续推流：一条 keep-alive 连接连推 200 帧，全部要被接受且顺序不乱。
+    #[test]
+    fn keeps_post_channel_healthy_under_sustained_load() {
+        let (tx, _events) = channel();
+        let w = Wireless::new(tx);
+        let info = w.ensure_started();
+        if !info.available {
+            eprintln!("跳过：无线服务不可用（{}）", info.hint);
+            return;
+        }
+        let (frames, _pending) = w.subscribe();
+        let mut rd = connect(info.port);
+        let total = 200usize;
+        for i in 0..total {
+            let body = vec![0xFF, 0xD8, i as u8, (i >> 8) as u8, 0x11, 0x22, 0xFF, 0xD9];
+            let head = format!(
+                "POST /frame?t={}&name=stress HTTP/1.1\r\nHost: {}\r\nContent-Type: image/jpeg\r\nContent-Length: {}\r\n\r\n",
+                info.token, info.lan, body.len()
+            );
+            rd.get_mut().write_all(head.as_bytes()).unwrap();
+            rd.get_mut().write_all(&body).unwrap();
+            let resp = read_head(&mut rd);
+            assert!(resp.starts_with("HTTP/1.1 204"), "第 {i} 帧被拒：{resp}");
+            let got = frames.recv_timeout(Duration::from_secs(3)).unwrap_or_else(|_| panic!("第 {i} 帧没到 sink"));
+            assert_eq!(got, body, "第 {i} 帧内容不一致");
+        }
         w.clear_sink();
     }
 }

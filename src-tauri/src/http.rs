@@ -180,6 +180,43 @@ pub fn write_status<W: Write>(w: &mut W, status: u16, reason: &str) -> io::Resul
     write_response(w, status, reason, "text/plain; charset=utf-8", &[], reason.as_bytes())
 }
 
+/// 保持连接的响应：手机逐帧 POST 上行时复用同一条 TLS 连接，避免每帧重新握手。
+pub fn write_response_keep_alive<W: Write>(
+    w: &mut W,
+    status: u16,
+    reason: &str,
+    content_type: &str,
+    body: &[u8],
+) -> io::Result<()> {
+    let headers: Vec<(&str, String)> = vec![
+        ("Content-Type", content_type.to_string()),
+        ("Content-Length", body.len().to_string()),
+        ("Cache-Control", "no-store".to_string()),
+        ("Connection", "keep-alive".to_string()),
+    ];
+    write_head(w, status, reason, &headers)?;
+    w.write_all(body)?;
+    w.flush()
+}
+
+/// 请求头里的 Content-Length（缺省 0）。
+pub fn content_length(req: &Request) -> usize {
+    req.header("content-length").and_then(|v| v.trim().parse().ok()).unwrap_or(0)
+}
+
+/// 按 Content-Length 读取请求体，超过 8MB 视为异常。
+pub fn read_body<S: Read>(rd: &mut BufReader<S>, len: usize) -> io::Result<Vec<u8>> {
+    const MAX_BODY: usize = 8 * 1024 * 1024;
+    if len > MAX_BODY {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "请求体过大"));
+    }
+    let mut body = vec![0u8; len];
+    if len > 0 {
+        rd.read_exact(&mut body)?;
+    }
+    Ok(body)
+}
+
 /// WebSocket 握手应答键：base64(sha1(key + GUID))。
 pub fn ws_accept_key(key: &str) -> String {
     use base64::Engine as _;

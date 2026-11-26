@@ -6,6 +6,40 @@ use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+fn ffmpeg_exe_name() -> &'static str {
+    if cfg!(windows) {
+        "ffmpeg.exe"
+    } else {
+        "ffmpeg"
+    }
+}
+
+/// 各平台常见的安装位置。
+#[cfg(target_os = "windows")]
+fn common_ffmpeg_paths() -> Vec<PathBuf> {
+    ["C:/ffmpeg/bin/ffmpeg.exe", "C:/Program Files/ffmpeg/bin/ffmpeg.exe"]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+#[cfg(not(target_os = "windows"))]
+fn common_ffmpeg_paths() -> Vec<PathBuf> {
+    ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"]
+        .iter()
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// 缺 ffmpeg 时给用户的安装提示（按平台）。
+pub fn install_hint() -> &'static str {
+    if cfg!(windows) {
+        "（Windows：winget install Gyan.FFmpeg，或把 ffmpeg.exe 放到应用目录，或设置 MONITOR_FFMPEG 指向它）"
+    } else {
+        "（macOS：brew install ffmpeg）"
+    }
+}
+
 pub fn ffmpeg_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("MONITOR_FFMPEG") {
         let p = PathBuf::from(p);
@@ -13,15 +47,33 @@ pub fn ffmpeg_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    for p in ["/opt/homebrew/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/usr/bin/ffmpeg"] {
-        let pb = PathBuf::from(p);
+    // 与主程序同目录（安装包/绿色版自带 ffmpeg 时优先用自带的，不依赖系统 PATH）
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            for cand in [
+                dir.join(ffmpeg_exe_name()),
+                dir.join("bin").join(ffmpeg_exe_name()),
+            ] {
+                if cand.is_file() {
+                    return Some(cand);
+                }
+            }
+        }
+    }
+    for pb in common_ffmpeg_paths() {
         if pb.is_file() {
             return Some(pb);
         }
     }
-    let out = Command::new("which").arg("ffmpeg").output().ok()?;
+    let lister = if cfg!(windows) { "where" } else { "which" };
+    let out = Command::new(lister).arg("ffmpeg").output().ok()?;
     if out.status.success() {
-        let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let s = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_string();
         if !s.is_empty() {
             return Some(PathBuf::from(s));
         }

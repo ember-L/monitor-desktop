@@ -12,10 +12,18 @@ use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-/// 默认素材目录：~/Movies/MONITOR。
+/// 默认素材目录：macOS 是 ~/Movies/MONITOR，Windows 是 %USERPROFILE%\Videos\MONITOR。
 pub fn captures_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_default();
-    PathBuf::from(home).join("Movies").join("MONITOR")
+    #[cfg(target_os = "windows")]
+    let (home, sub) = (
+        std::env::var("USERPROFILE")
+            .or_else(|_| std::env::var("HOME"))
+            .unwrap_or_default(),
+        "Videos",
+    );
+    #[cfg(not(target_os = "windows"))]
+    let (home, sub) = (std::env::var("HOME").unwrap_or_default(), "Movies");
+    PathBuf::from(home).join(sub).join("MONITOR")
 }
 
 pub fn ensure_dir(dir: &Path) -> Result<(), String> {
@@ -243,7 +251,10 @@ mod tests {
         std::fs::write(&p1, b"x").unwrap();
         let (n2, _p2) = unique_name(&dir, "photo", "jpg");
         assert_ne!(n1, n2);
-        assert!(n2.ends_with("-2.jpg"));
+        // 同一秒内应加 -2 后缀；跨秒时时间戳本来就变了，也属正常。
+        if n2.starts_with(n1.trim_end_matches(".jpg")) {
+            assert!(n2.ends_with("-2.jpg"));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

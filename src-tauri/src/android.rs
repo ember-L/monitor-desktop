@@ -16,6 +16,24 @@ pub struct AndroidDevice {
     pub model: String,
 }
 
+fn adb_candidates() -> Vec<PathBuf> {
+    let home = std::env::var(if cfg!(windows) { "USERPROFILE" } else { "HOME" }).unwrap_or_default();
+    let mut v: Vec<PathBuf> = Vec::new();
+    if cfg!(windows) {
+        v.push(PathBuf::from(format!(
+            "{home}/AppData/Local/Android/Sdk/platform-tools/adb.exe"
+        )));
+        v.push(PathBuf::from("C:/Android/platform-tools/adb.exe"));
+    } else {
+        v.push(PathBuf::from(format!(
+            "{home}/Library/Android/sdk/platform-tools/adb"
+        )));
+        v.push(PathBuf::from("/opt/homebrew/bin/adb"));
+        v.push(PathBuf::from("/usr/local/bin/adb"));
+    }
+    v
+}
+
 pub fn adb_path() -> Option<PathBuf> {
     if let Ok(p) = std::env::var("MONITOR_ADB") {
         let p = PathBuf::from(p);
@@ -23,21 +41,21 @@ pub fn adb_path() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    if let Ok(out) = Command::new("which").arg("adb").output() {
+    let lister = if cfg!(windows) { "where" } else { "which" };
+    if let Ok(out) = Command::new(lister).arg("adb").output() {
         if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let s = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .to_string();
             if !s.is_empty() {
                 return Some(PathBuf::from(s));
             }
         }
     }
-    let home = std::env::var("HOME").unwrap_or_default();
-    for p in [
-        format!("{home}/Library/Android/sdk/platform-tools/adb"),
-        "/opt/homebrew/bin/adb".to_string(),
-        "/usr/local/bin/adb".to_string(),
-    ] {
-        let pb = PathBuf::from(p);
+    for pb in adb_candidates() {
         if pb.is_file() {
             return Some(pb);
         }

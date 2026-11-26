@@ -9,7 +9,6 @@
 
 import { computeLayout, PRESETS, MODES, resolveRatio } from './layout.js';
 import { formatClock, formatSecs, formatFps, formatResolution, formatBytes, shortPath, friendlyError, parseRatioInput } from './format.js';
-import { parseMjpegStream } from './mjpeg.js';
 
 /* ------------------------------------------------------------------ */
 /* 基础状态                                                            */
@@ -49,12 +48,15 @@ const state = {
   streamAbort: null,
   streamToken: 0,
   reconnectTimer: 0,
+  pollTimer: 0,
   streamFailures: 0,
   decodeFailures: 0,
   deleteArmed: '',
+  immersive: false,
+  zoomAt: 0,
   busy: { devices: false, photo: false, record: false, pair: false, viewer: false },
   wireless: { open: false, connected: false, url: '', info: null },
-  timers: { clock: 0, rec: 0, refresh: 0, ratio: 0, deleteArm: 0 },
+  timers: { clock: 0, rec: 0, refresh: 0, ratio: 0, deleteArm: 0, wirelessHint: 0, frameWatch: 0, wirelessDiag: 0, zoomSync: 0 },
 };
 
 /* ------------------------------------------------------------------ */
@@ -284,6 +286,18 @@ function stopStream() {
   state.streamToken += 1;
   clearTimeout(state.reconnectTimer);
   state.reconnectTimer = 0;
+  clearTimeout(state.pollTimer);
+  state.pollTimer = 0;
+}
+
+/**
+ * 把本地取景服务的 /stream 换成单帧地址 /frame.jpg。
+ * 原因：WKWebView（Tauri 的 WKWebView / macOS）拿不到 multipart 长连接的流式 body，
+ * fetch 打开后第一次 read 直接 TypeError: Load failed，桌面端永远收不到画面。
+ * 单帧请求-响应在 WebKit 里稳定，代价只是每帧一个本地小请求。
+ */
+function snapshotUrl(streamUrl) {
+  return streamUrl.replace(/\/stream(?=$|[?#])/, '/frame.jpg');
 }
 
 function connectStream() {
@@ -291,39 +305,59 @@ function connectStream() {
   if (!state.info || !state.info.streamUrl) return;
   stopStream();
   const token = state.streamToken;
-  const controller = new AbortController();
-  state.streamAbort = controller;
-  const base = state.info.streamUrl;
-  const url = base + (base.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
+  const base = snapshotUrl(state.info.streamUrl);
+  let inFlight = false;
 
-  fetch(url, { cache: 'no-store', signal: controller.signal })
-    .then(function (response) {
-      if (!response.ok) throw new Error('画面服务返回 ' + response.status);
-      return parseMjpegStream(response, { onFrame: queueFrame, signal: controller.signal });
-    })
-    .catch(function (err) {
+  async function tick() {
+    if (token !== state.streamToken || !state.source) return;
+    if (inFlight) {
+      state.pollTimer = setTimeout(tick, 16);
+      return;
+    }
+    inFlight = true;
+    const controller = new AbortController();
+    state.streamAbort = controller;
+    let next = 30;
+    try {
+      const url = base + (base.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
+      const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
+      if (token !== state.streamToken) return;
+      if (response.status === 404) {
+        // 设备已连上但还没有帧：稍等再试
+        next = 120;
+      } else if (!response.ok) {
+        throw new Error('画面服务返回 ' + response.status);
+      } else {
+        const buffer = await response.arrayBuffer();
+        if (token !== state.streamToken) return;
+        if (buffer.byteLength) queueFrame(new Uint8Array(buffer));
+      }
+    } catch (err) {
       if (controller.signal.aborted) return;
       if (err && err.name === 'AbortError') return;
-      state.streamFailures += 1;
-      if (state.streamFailures === 6 && state.status === 'live') {
-        toast('画面流断开，正在自动重连…', 'error');
+      if (!state.lastBitmap) {
+        // 还没出过画面：多半是设备刚连上、帧还没到，安静重试，别报「流断开」。
+        state.streamFailures = 0;
+        next = 200;
+      } else {
+        state.streamFailures += 1;
+        next = 300;
+        if (state.streamFailures === 6) {
+          toast('画面流断开，正在自动重连…', 'error');
+        } else if (state.streamFailures === 30) {
+          toast('本地画面取不到：' + (err && err.message ? err.message : '网络错误'), 'error');
+        }
       }
-    })
-    .finally(function () {
-      if (token !== state.streamToken) return;
-      state.streamAbort = null;
-      scheduleReconnect(token);
-    });
-}
+    } finally {
+      inFlight = false;
+      if (token === state.streamToken) {
+        state.streamAbort = null;
+        if (state.source) state.pollTimer = setTimeout(tick, next);
+      }
+    }
+  }
 
-function scheduleReconnect(token) {
-  if (!state.source) return;
-  clearTimeout(state.reconnectTimer);
-  state.reconnectTimer = setTimeout(function () {
-    if (token !== state.streamToken) return;
-    if (!state.source) return;
-    connectStream();
-  }, 300);
+  tick();
 }
 
 function queueFrame(bytes) {
@@ -503,6 +537,7 @@ async function refreshDevices(options) {
 
 async function releaseSource() {
   stopStream();
+  clearFrameWatch();
   resetFrameState();
   const previous = state.source;
   state.source = null;
@@ -512,6 +547,7 @@ async function releaseSource() {
   state.recSecs = 0;
   updateRecordingUi();
   updateHud();
+  clearWirelessHint();
   if (previous) {
     try { await invoke('stop_source'); } catch (err) { /* 已经停止 */ }
   }
@@ -521,13 +557,19 @@ async function releaseSource() {
 
 async function selectSource(kind, id, label) {
   const same = state.source && state.source.kind === kind && state.source.id === id;
-  if (same && (state.status === 'live' || state.status === 'connecting')) return;
+  if (same && state.status === 'connecting') {
+    // 再点一次同一个设备：不重开，但重新给出「还没收到画面」的提示。
+    if (kind === 'wireless') armWirelessHint();
+    return;
+  }
+  if (same && state.status === 'live') return;
   if (state.recording) await stopRecording();
   await releaseSource();
   state.source = { kind: kind, id: id, label: label || '设备' };
   state.gen = 0;
   state.streamFailures = 0;
   setStatus('connecting', '正在启动 ' + (label || '设备') + '…');
+  if (kind === 'wireless') armWirelessHint();
   updateHud();
   renderDevices();
   try {
@@ -909,6 +951,7 @@ async function openWireless() {
   setHidden(dom.wirelessModal, false);
   renderPair(state.wireless.info || null);
   await refreshPair({ silent: true });
+  startPairDiag();
 }
 
 /* 重新读取本机 IP：换 Wi‑Fi、插网线、关 VPN 后地址会变，二维码随之重建。 */
@@ -1003,11 +1046,72 @@ function renderPair(info) {
   }
 }
 
+/* 无线诊断：分「手机没连过来 / 连到电脑但页面没开 / 页面开了没推流 / 推流中」 */
+function startPairDiag() {
+  stopPairDiag();
+  pollPairDiag();
+}
+
+function stopPairDiag() {
+  if (state.timers.wirelessDiag) {
+    clearTimeout(state.timers.wirelessDiag);
+    state.timers.wirelessDiag = 0;
+  }
+}
+
+async function pollPairDiag() {
+  if (!state.wireless.open) return;
+  try {
+    const info = await invoke('pair_diag');
+    if (info && state.wireless.open) renderPairDiag(info);
+  } catch (err) {
+    /* 取不到诊断就保留静态提示 */
+  }
+  if (state.wireless.open) {
+    state.timers.wirelessDiag = setTimeout(pollPairDiag, 1500);
+  }
+}
+
+function renderPairDiag(d) {
+  const peers = Number(d.accepts) || 0;
+  const pages = Number(d.pageLoads) || 0;
+  const frames = (Number(d.framePosts) || 0) + (Number(d.wsFrames) || 0);
+  const tokenErr = String(d.lastError || '').indexOf('配对码') >= 0;
+  let status = '手机还没有连过来';
+  let tone = 'warn';
+  let hint = '手机与电脑要连同一个 Wi‑Fi；用手机「相机」或 Safari 扫码（微信里点右上角「…」→「在 Safari 中打开」）。';
+  if (d.connected && frames > 0) {
+    status = '手机已连接，画面传输中';
+    tone = 'live';
+    hint = '如果桌面还没画面，点一下左侧「无线（扫码）」重新选中设备源。';
+  } else if (d.connected) {
+    status = '手机已连上，但还没收到画面';
+    tone = 'warn';
+    hint = '在手机上点「开始发送」，并允许使用摄像头；提示配对码无效就在电脑上「刷新地址」后重扫。';
+  } else if (pages > 0) {
+    status = '手机打开了页面，但还没推流';
+    tone = 'warn';
+    hint = '在手机上点「开始发送」，并允许使用摄像头。';
+  } else if (peers > 0) {
+    status = tokenErr ? '配对码不对，页面没打开' : '手机连到了电脑，但页面没打开';
+    tone = 'error';
+    hint = tokenErr
+      ? '二维码已过期：在电脑上点「刷新地址」，再用手机重扫。'
+      : '证书没被信任：在手机的警告页点「显示详细信息」→「访问此网站」；微信、QQ 里打不开，请改用相机或 Safari。';
+  }
+  if (dom.wirelessStatus) {
+    setText(dom.wirelessStatus, status);
+    dom.wirelessStatus.setAttribute('data-tone', tone);
+  }
+  if (dom.wirelessHint) setText(dom.wirelessHint, hint);
+}
+
 async function closeWireless() {
   if (!dom.wirelessModal) return;
   const wasConnected = state.wireless.connected;
   setHidden(dom.wirelessModal, true);
   state.wireless.open = false;
+  stopPairDiag();
   if (!wasConnected) {
     try { await invoke('pair_stop'); } catch (err) { /* 服务已停止 */ }
   }
@@ -1047,6 +1151,44 @@ async function copyWirelessUrl() {
 /* Toast                                                              */
 /* ------------------------------------------------------------------ */
 
+/* 无线源已连上、但迟迟没有画面时给出可执行的提示（手机端多半还没开始推流）。 */
+function clearWirelessHint() {
+  if (state.timers.wirelessHint) {
+    clearTimeout(state.timers.wirelessHint);
+    state.timers.wirelessHint = 0;
+  }
+}
+
+function armWirelessHint() {
+  clearWirelessHint();
+  state.timers.wirelessHint = setTimeout(function () {
+    state.timers.wirelessHint = 0;
+    if (!state.source || state.source.kind !== 'wireless') return;
+    if (state.status === 'live') return;
+    toast('手机已连接，但还没收到画面：请确认手机页面已允许访问相机，并保持页面在前台。', 'error');
+    setStatus('connecting', '等待手机推流：请确认手机页面已允许访问相机');
+  }, 6000);
+}
+
+/* 手机锁屏/切后台会暂停推流：帧停了就把状态讲清楚，别让最后一帧冒充实时画面。 */
+function clearFrameWatch() {
+  if (state.timers.frameWatch) {
+    clearTimeout(state.timers.frameWatch);
+    state.timers.frameWatch = 0;
+  }
+}
+
+function armFrameWatch() {
+  clearFrameWatch();
+  if (!state.source || state.source.kind !== "wireless") return;
+  state.timers.frameWatch = setTimeout(function () {
+    state.timers.frameWatch = 0;
+    if (!state.source || state.source.kind !== "wireless") return;
+    if (state.status !== "live") return;
+    setStatus("connecting", "等待手机画面：请让手机页面保持在前台，锁屏会暂停推流");
+  }, 4000);
+}
+
 function toast(text, level) {
   if (!dom.toasts || !text) return;
   const node = el('div', 'toast', text);
@@ -1072,12 +1214,16 @@ function onSourceState(payload) {
     return;
   }
   if (next === 'error') {
+    clearWirelessHint();
+    clearFrameWatch();
     stopStream();
     resetFrameState();
     if (state.source) setStatus('error', payload.detail || friendlyError(payload.detail, '设备出错了'));
     return;
   }
   if (next === 'stopped') {
+    clearWirelessHint();
+    clearFrameWatch();
     if (state.source) {
       state.source = null;
       stopStream();
@@ -1089,6 +1235,8 @@ function onSourceState(payload) {
     return;
   }
   if (next === 'live') {
+    clearWirelessHint();
+    armFrameWatch();
     if (!state.source) return;
     const changed = gen > 0 && gen !== state.gen;
     if (changed) {
@@ -1101,6 +1249,7 @@ function onSourceState(payload) {
 }
 
 function onFrameInfo(payload) {
+  armFrameWatch();
   if (!payload) return;
   const gen = Number(payload.gen) || 0;
   if (gen > 0 && state.gen > 0 && gen !== state.gen) return;
@@ -1132,11 +1281,14 @@ function onWireless(payload) {
   const label = payload.name ? '无线 · ' + payload.name : '无线设备';
   if (!state.source || state.source.kind !== 'wireless') {
     selectSource('wireless', 'phone', label);
+  } else if (state.status !== 'live') {
+    armWirelessHint();
   }
   if (state.wireless.open) {
     setTimeout(function () {
       if (state.wireless.open) setHidden(dom.wirelessModal, true);
       state.wireless.open = false;
+      stopPairDiag();
     }, 900);
   }
 }
@@ -1170,7 +1322,7 @@ function cacheDom() {
     'wireless-status', 'wireless-hint', 'btn-wireless-close', 'wireless-ip', 'wireless-ip-current',
     'btn-refresh-ip', 'viewer', 'viewer-title',
     'viewer-stage', 'btn-viewer-close', 'viewer-meta', 'btn-viewer-open', 'btn-viewer-reveal',
-    'btn-viewer-delete',
+    'btn-viewer-delete', 'btn-zoom', 'app',
   ];
   ids.forEach(function (id) {
     const key = id.replace(/-([a-z])/g, function (_, letter) { return letter.toUpperCase(); });
@@ -1304,11 +1456,12 @@ function bindDom() {
     });
   }
 
-  if (dom.btnFullscreen) dom.btnFullscreen.addEventListener('click', function () { toggleFullscreen(); });
-  document.addEventListener('fullscreenchange', function () {
-    const active = !!document.fullscreenElement;
-    if (dom.btnFullscreen) dom.btnFullscreen.setAttribute('aria-pressed', active ? 'true' : 'false');
-    setTimeout(paint, 60);
+  if (dom.btnFullscreen) dom.btnFullscreen.addEventListener('click', function () { toggleZoom(); });
+  if (dom.btnZoom) dom.btnZoom.addEventListener('click', function () { toggleZoom(); });
+  // 用户用系统方式退出全屏（Esc / 绿灯）时，收回放大布局
+  window.addEventListener('resize', function () {
+    clearTimeout(state.timers.zoomSync);
+    state.timers.zoomSync = setTimeout(syncImmersiveFromWindow, 300);
   });
 
   if (dom.btnCopyUrl) dom.btnCopyUrl.addEventListener('click', function () { copyWirelessUrl(); });
@@ -1361,6 +1514,11 @@ function onKeyDown(event) {
     return;
   }
   if (isTypingTarget(event.target)) return;
+  if (event.key === 'Escape' && state.immersive) {
+    event.preventDefault();
+    setImmersive(false);
+    return;
+  }
 
   const key = (event.key || '').toLowerCase();
   if (event.key === ' ' || event.code === 'Space') {
@@ -1385,20 +1543,63 @@ function onKeyDown(event) {
   }
   if (key === 'f') {
     event.preventDefault();
-    toggleFullscreen();
+    toggleZoom();
   }
 }
 
-async function toggleFullscreen() {
+/* ------------------------------------------------------------------ */
+/* 放大取景                                                            */
+/* ------------------------------------------------------------------ */
+
+function currentWindow() {
   try {
-    if (!document.fullscreenElement) {
-      await document.documentElement.requestFullscreen();
-    } else {
-      await document.exitFullscreen();
-    }
+    const api = window.__TAURI__ && window.__TAURI__.window;
+    if (!api || typeof api.getCurrentWindow !== 'function') return null;
+    return api.getCurrentWindow();
   } catch (err) {
-    toast('无法进入全屏，可以按系统快捷键切换', 'error');
+    return null;
   }
+}
+
+/**
+ * 放大取景：先把界面切成沉浸式（藏起顶栏/侧栏/胶片条，画面铺满窗口），
+ * 再尽力把窗口本身切到系统全屏。窗口全屏失败也不影响放大效果。
+ */
+function setImmersive(on, options) {
+  const next = !!on;
+  state.immersive = next;
+  state.zoomAt = Date.now();
+  if (dom.app) dom.app.classList.toggle('is-immersive', next);
+  [dom.btnZoom, dom.btnFullscreen].forEach(function (btn) {
+    if (!btn) return;
+    btn.setAttribute('aria-pressed', next ? 'true' : 'false');
+    btn.title = next ? '退出放大（F）' : '放大取景（F）';
+  });
+  const win = currentWindow();
+  if (win && typeof win.setFullscreen === 'function') {
+    Promise.resolve(win.setFullscreen(next)).catch(function () { /* 没有权限就用界面放大 */ });
+  }
+  setTimeout(paint, 60);
+  setTimeout(paint, 320);
+  if (!(options && options.silent)) {
+    toast(next ? '已放大取景，按 Esc 或 F 退出' : '已退出放大取景', 'info');
+  }
+}
+
+function toggleZoom() {
+  setImmersive(!state.immersive);
+}
+
+/** 窗口不是系统全屏了（用户按 Esc 或点了绿灯），就别再占着沉浸式布局。 */
+function syncImmersiveFromWindow() {
+  if (!state.immersive || Date.now() - state.zoomAt < 900) return;
+  const win = currentWindow();
+  if (!win || typeof win.isFullscreen !== 'function') return;
+  Promise.resolve(win.isFullscreen()).then(function (full) {
+    if (!full && state.immersive && Date.now() - state.zoomAt >= 900) {
+      setImmersive(false, { silent: true });
+    }
+  }).catch(function () { /* 查询失败就维持现状 */ });
 }
 
 /* ------------------------------------------------------------------ */

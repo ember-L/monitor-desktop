@@ -124,7 +124,7 @@
           <span><kbd>G</kbd> 网格</span>
           <span><kbd>M</kbd> 镜像</span>
           <span><kbd>R</kbd> 录像</span>
-          <span><kbd>F</kbd> 全屏</span>
+          <span><kbd>F</kbd> 放大</span>
         </p>
       </section>
     </aside>
@@ -166,6 +166,11 @@
         </div>
 
         <div class="flash" id="flash" hidden></div>
+
+        <button class="btn btn-icon btn-stage-zoom" id="btn-zoom" type="button" title="放大取景（F）" aria-pressed="false">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.6" cy="8.6" r="4.7" fill="none" stroke="currentColor" stroke-width="1.4" /><path d="M12.1 12.1L16.5 16.5M8.6 6.4v4.4M6.4 8.6h4.4" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" /></svg>
+          <span class="sr-only">放大取景</span>
+        </button>
       </div>
     </section>
   </main>
@@ -211,6 +216,11 @@
         </div>
         <p class="wireless-status" id="wireless-status">等待手机连接…</p>
         <p class="wireless-hint" id="wireless-hint">手机与电脑连同一个 Wi‑Fi；首次打开需要在手机上信任本地证书。</p>
+        <ol class="wireless-steps">
+          <li>手机和电脑连同一个 Wi‑Fi。</li>
+          <li>用手机「相机」或 Safari 扫码；微信扫码后点右上角「…」→「在 Safari 中打开」。</li>
+          <li>证书警告点「显示详细信息」→「访问此网站」。</li>
+        </ol>
       </div>
     </div>
   </div>

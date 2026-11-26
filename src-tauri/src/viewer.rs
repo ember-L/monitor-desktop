@@ -104,11 +104,32 @@ impl Viewer {
             self.serve_stream(stream);
             return;
         }
+        // 单帧快照：给不支持长连接流式读取的 WebView 兜底轮询用。
+        if path == "/frame.jpg" || path == "/frame" {
+            let jpeg = self.latest.lock().ok().and_then(|l| l.jpeg.clone());
+            match jpeg {
+                Some(bytes) => {
+                    let extra = [
+                        ("Cache-Control", "no-store".to_string()),
+                        ("Access-Control-Allow-Origin", "*".to_string()),
+                    ];
+                    let _ = http::write_response(&mut stream, 200, "OK", "image/jpeg", &extra, &bytes);
+                }
+                None => {
+                    // 404 也要带 CORS 头：否则 WKWebView 里 fetch 会直接抛 TypeError，
+                    // 前端分不清「还没收到帧」和「取景服务挂了」。
+                    let extra = [("Access-Control-Allow-Origin", "*".to_string())];
+                    let _ = http::write_response(&mut stream, 404, "Not Found", "text/plain", &extra, b"");
+                }
+            }
+            return;
+        }
         if path == "/qr" {
             let png = self.qr.lock().ok().and_then(|q| q.clone());
             match png {
                 Some(bytes) => {
-                    let _ = http::write_response(&mut stream, 200, "OK", "image/png", &[], &bytes);
+                    let extra = [("Access-Control-Allow-Origin", "*".to_string())];
+                    let _ = http::write_response(&mut stream, 200, "OK", "image/png", &extra, &bytes);
                 }
                 None => {
                     let _ = http::write_status(&mut stream, 404, "Not Found");
@@ -117,7 +138,8 @@ impl Viewer {
             return;
         }
         if path == "/health" {
-            let _ = http::write_response(&mut stream, 200, "OK", "text/plain", &[], b"ok");
+            let extra = [("Access-Control-Allow-Origin", "*".to_string())];
+            let _ = http::write_response(&mut stream, 200, "OK", "text/plain", &extra, b"ok");
             return;
         }
         if let Some(name) = path.strip_prefix("/media/") {
@@ -249,7 +271,7 @@ impl Viewer {
     /// MJPEG：每帧一个 JPEG part，紧跟最新帧；客户端断开即退出。
     fn serve_stream(&self, mut stream: TcpStream) {
         let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-store\r\nPragma: no-cache\r\nConnection: close\r\n\r\n"
+            "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-store\r\nPragma: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
         );
         if stream.write_all(head.as_bytes()).is_err() {
             return;
@@ -351,6 +373,20 @@ mod tests {
         assert!(text.contains("--frame"), "{text}");
         assert!(text.contains(&format!("Content-Length: {}", jpeg.len())), "{text}");
         assert!(acc.windows(jpeg.len()).any(|w| w == jpeg.as_slice()), "payload bytes missing");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn missing_frame_returns_cors_aware_404() {
+        let root = temp_root("noframe");
+        let viewer = Viewer::start(root.clone()).unwrap();
+        let raw = request(
+            viewer.port,
+            "GET /frame.jpg HTTP/1.1\r\nHost: x\r\nOrigin: tauri://localhost\r\n\r\n",
+        );
+        let text = String::from_utf8_lossy(&raw).to_ascii_lowercase();
+        assert!(text.starts_with("http/1.1 404 not found"), "{text}");
+        assert!(text.contains("access-control-allow-origin: *"), "{text}");
         let _ = std::fs::remove_dir_all(&root);
     }
 

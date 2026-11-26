@@ -13,6 +13,11 @@
 # 本地镜像加速配置（可选，删除后回退官方源）
 /.cargo/config.toml
 
+# 本机交叉编译工具链与缓存（仅本机 Windows 交叉校验用）
+/.rustup
+/.xwin-cache
+/.brew-cache
+
 # 本地生成的证书 / 临时脚本产物
 /.certs
 /.tmp
