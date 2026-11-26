@@ -138,10 +138,6 @@ struct NoticePayload {
     level: String,
 }
 
-fn name_of(path: &std::path::Path) -> String {
-    path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
-}
-
 #[tauri::command]
 fn app_info(app: State<'_, Arc<App>>) -> AppInfo {
     #[cfg(debug_assertions)]
@@ -440,9 +436,6 @@ fn spawn_pump(app: Arc<App>, handle: AppHandle, rx: Receiver<Event>) {
                 }
                 Ok(Event::Wireless { connected, name, hint }) => {
                     let _ = handle.emit("wireless", WirelessPayload { connected, name, hint });
-                }
-                Ok(Event::Notice(text)) => {
-                    let _ = handle.emit("notice", NoticePayload { text, level: "info".into() });
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,

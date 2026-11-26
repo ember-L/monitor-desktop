@@ -144,6 +144,7 @@ impl Wireless {
         }
     }
 
+    #[allow(dead_code)]
     pub fn info(&self) -> Option<PairInfo> {
         self.info.lock().ok().and_then(|i| i.clone())
     }
@@ -249,7 +250,7 @@ fn serve_conn(w: Arc<Wireless>, cfg: Arc<rustls::ServerConfig>, stream: TcpStrea
     };
     let path = req.path.clone();
 
-    if path == "/ws" {
+    if path == "/ws" && req.is_websocket_upgrade() {
         let Some(key) = req.header("sec-websocket-key").map(|s| s.to_string()) else {
             let _ = http::write_status(rd.get_mut(), 400, "Bad Request");
             return;

@@ -12,7 +12,7 @@ brew install ffmpeg
 # adb：安装 Android platform-tools，或 brew install --cask android-platform-tools
 
 pnpm install            # 只装 @tauri-apps/cli，ui/ 是纯静态文件
-pnpm tauri build        # 发布构建 + 生成 .app
+pnpm build              # 发布构建 + 生成 .app（自动探测 Rust 工具链）
 open target/release/bundle/macos/MONITOR.app
 ```
 
@@ -21,6 +21,8 @@ macOS 也可以直接双击 **`启动.command`**（首次自动 `cargo build --r
 未签名的 .app 首次打开可能被 Gatekeeper 拦下：右键 →「打开」，或 `xattr -dr com.apple.quarantine target/release/bundle/macos/MONITOR.app`。
 
 工具链装在项目内 `.rust/` 目录也能用（`RUSTUP_HOME` / `CARGO_HOME` 指过去即可），启动脚本会自动识别。
+
+`pnpm` 脚本经 `scripts/tauri.mjs` 包装：先找到 cargo（`PATH`、`~/.cargo/bin`、项目内 `.rust/cargo`、`~/.rustup/toolchains/*`），把它的目录补进 `PATH`，再调用 Tauri CLI。若看到 `failed to run 'cargo metadata' ... No such file or directory`，说明当前 shell 的 `PATH` 里没有 cargo——改用 `pnpm build` / `pnpm dev`，或手动把 cargo 目录加进 `PATH`。排查可用 `MONITOR_PRINT_TOOLCHAIN=1 pnpm tauri --version` 打印探测到的工具链。
 
 ## 设备源
 
@@ -67,10 +69,10 @@ macOS 也可以直接双击 **`启动.command`**（首次自动 `cargo build --r
 ## 开发
 
 ```bash
-pnpm tauri dev                       # 开发模式（ui/ 由 WebView 直接加载，改前端刷新即生效）
+pnpm dev                             # 开发模式（ui/ 由 WebView 直接加载，改前端刷新即生效）
 cargo test                           # Rust 单元 / 集成测试
 node --test ui/tests/*.test.mjs      # 前端逻辑测试
-pnpm tauri build                     # 发布构建
+pnpm build                           # 发布构建
 ```
 
 目录：

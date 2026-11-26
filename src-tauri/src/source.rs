@@ -21,6 +21,8 @@ pub enum DeviceId {
 }
 
 impl DeviceId {
+    /// 稳定标识（日志 / 去重用；界面直接传 kind + id）。
+    #[allow(dead_code)]
     pub fn key(&self) -> String {
         match self {
             DeviceId::Av(i) => format!("av:{i}"),
@@ -69,8 +71,9 @@ pub struct DeviceLists {
     pub adb_ok: bool,
 }
 
-/// 缩略图（JPEG）。
+/// 缩略图（JPEG）。宽高只用于自检与测试，界面直接渲染 JPEG。
 #[derive(Clone)]
+#[allow(dead_code)]
 pub struct Thumb {
     pub width: u32,
     pub height: u32,
@@ -82,7 +85,6 @@ pub enum Event {
     Frame { gen: u64, frame: Frame },
     State { gen: u64, state: SourceState },
     Wireless { connected: bool, name: Option<String>, hint: Option<String> },
-    Notice(String),
 }
 
 /// 枚举设备（阻塞，命令层放到阻塞线程池调用）。
@@ -432,7 +434,7 @@ pub fn spawn_wireless(gen: u64, tx: Sender<Event>, wireless: Arc<Wireless>) -> R
     let stop = Arc::new(AtomicBool::new(false));
     let rx: Receiver<Vec<u8>> = wireless.subscribe();
     let _ = tx.send(Event::State { gen, state: SourceState::Starting });
-    let mut handle = SourceHandle {
+    let handle = SourceHandle {
         stop: stop.clone(),
         children: Arc::new(Mutex::new(Vec::new())),
         threads: Mutex::new(Vec::new()),

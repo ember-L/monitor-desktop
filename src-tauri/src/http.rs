@@ -3,7 +3,9 @@
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 
+/// 解析结果保留完整请求行（method/version 目前未参与路由，便于以后扩展）。
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct Request {
     pub method: String,
     pub path: String,
@@ -204,6 +206,7 @@ pub struct WsConn<S: Read + Write> {
 }
 
 impl<S: Read + Write> WsConn<S> {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(stream: S) -> Self {
         Self { rd: BufReader::with_capacity(64 * 1024, stream), closed: false }
     }
@@ -276,6 +279,7 @@ impl<S: Read + Write> WsConn<S> {
         w.flush()
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn write_binary(&mut self, data: &[u8]) -> io::Result<()> {
         self.write_frame(0x2, data)
     }

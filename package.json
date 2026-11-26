@@ -4,9 +4,9 @@
   "version": "1.0.0",
   "description": "MONITOR · Tauri 桌面取景器",
   "scripts": {
-    "tauri": "tauri",
-    "dev": "tauri dev",
-    "build": "tauri build",
+    "tauri": "node scripts/tauri.mjs",
+    "dev": "node scripts/tauri.mjs dev",
+    "build": "node scripts/tauri.mjs build",
     "test:ui": "node --test ui/tests/*.test.mjs"
   },
   "devDependencies": {

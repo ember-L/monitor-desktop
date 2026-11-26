@@ -160,8 +160,6 @@ pub struct Recorder {
     start: Instant,
     pub name: String,
     pub path: PathBuf,
-    pub width: u32,
-    pub height: u32,
 }
 
 impl Recorder {
@@ -211,7 +209,7 @@ pub fn start_recording(frame: &Frame, fps: f32, dir: &Path) -> Result<Recorder, 
         run_ffmpeg_recording(child, stdin, rx, thread_path, width, height, start, None)
     });
 
-    Ok(Recorder { tx, join: Some(join), start, name, path, width, height })
+    Ok(Recorder { tx, join: Some(join), start, name, path })
 }
 
 #[cfg(test)]
