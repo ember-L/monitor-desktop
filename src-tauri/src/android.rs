@@ -10,7 +10,7 @@ use std::time::Duration;
 pub const SCRCPY_SERVER: &[u8] = include_bytes!("../assets/scrcpy-server-v3.1");
 pub const SCRCPY_VERSION: &str = "3.1";
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct AndroidDevice {
     pub serial: String,
     pub model: String,

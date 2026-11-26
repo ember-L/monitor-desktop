@@ -5,7 +5,7 @@ use crate::ffmpeg;
 use std::process::Command;
 use std::time::Duration;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize)]
 pub struct AvDevice {
     pub index: u32,
     pub name: String,

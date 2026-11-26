@@ -1,0 +1,15 @@
+{
+  "name": "monitor-desktop",
+  "private": true,
+  "version": "1.0.0",
+  "description": "MONITOR · Tauri 桌面取景器",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build",
+    "test:ui": "node --test ui/tests/*.test.mjs"
+  },
+  "devDependencies": {
+    "@tauri-apps/cli": "^2"
+  }
+}

@@ -1,4 +1,14 @@
+# 构建产物
 /target
+/src-tauri/target
+/src-tauri/gen
 /captures
 /.rust
 .DS_Store
+
+# 前端依赖
+/node_modules
+/.pnpm-store
+
+# 本地镜像加速配置（可选，删除后回退官方源）
+/.cargo/config.toml

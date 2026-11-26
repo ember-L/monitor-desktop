@@ -110,6 +110,77 @@ pub fn extract_jpegs(buf: &mut Vec<u8>) -> Vec<Vec<u8>> {
     out
 }
 
+/// 从 JPEG 数据本身解析尺寸（扫描 SOFn 段），无需完整解码。
+pub fn jpeg_size(jpeg: &[u8]) -> Option<(u32, u32)> {
+    if jpeg.len() < 4 || jpeg[0] != 0xFF || jpeg[1] != 0xD8 {
+        return None;
+    }
+    let mut i = 2usize;
+    while i + 3 < jpeg.len() {
+        if jpeg[i] != 0xFF {
+            i += 1;
+            continue;
+        }
+        let marker = jpeg[i + 1];
+        i += 2;
+        match marker {
+            0x00 | 0xFF | 0xD8 | 0x01 | 0xD0..=0xD7 => continue,
+            0xDA => return None, // 扫描数据先于 SOF，异常
+            0xC0..=0xCF if !matches!(marker, 0xC4 | 0xC8 | 0xCC) => {
+                if i + 7 > jpeg.len() {
+                    return None;
+                }
+                let h = u16::from_be_bytes([jpeg[i + 3], jpeg[i + 4]]) as u32;
+                let w = u16::from_be_bytes([jpeg[i + 5], jpeg[i + 6]]) as u32;
+                if w == 0 || h == 0 {
+                    return None;
+                }
+                return Some((w, h));
+            }
+            _ => {
+                if i + 1 >= jpeg.len() {
+                    return None;
+                }
+                let len = u16::from_be_bytes([jpeg[i], jpeg[i + 1]]) as usize;
+                if len < 2 {
+                    return None;
+                }
+                i += len;
+            }
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+mod jpeg_size_tests {
+    use super::*;
+
+    fn jpeg_with_sof(w: u16, h: u16) -> Vec<u8> {
+        let mut v = vec![0xFF, 0xD8];
+        v.extend_from_slice(&[0xFF, 0xE0, 0x00, 0x04, 0x00, 0x00]); // APP0
+        v.extend_from_slice(&[0xFF, 0xC0, 0x00, 0x0B, 0x08]);
+        v.extend_from_slice(&h.to_be_bytes());
+        v.extend_from_slice(&w.to_be_bytes());
+        v.extend_from_slice(&[0x01, 0x01, 0x11, 0x00]);
+        v.extend_from_slice(&[0xFF, 0xD9]);
+        v
+    }
+
+    #[test]
+    fn reads_dimensions_from_sof() {
+        assert_eq!(jpeg_size(&jpeg_with_sof(1280, 720)), Some((1280, 720)));
+        assert_eq!(jpeg_size(&jpeg_with_sof(1080, 2400)), Some((1080, 2400)));
+    }
+
+    #[test]
+    fn rejects_non_jpeg_and_truncated() {
+        assert_eq!(jpeg_size(b"not a jpeg"), None);
+        assert_eq!(jpeg_size(&[0xFF, 0xD8]), None);
+        assert_eq!(jpeg_size(&jpeg_with_sof(0, 720)), None);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

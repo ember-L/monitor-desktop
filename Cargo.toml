@@ -1,19 +1,6 @@
-[package]
-name = "monitor-desktop"
-version = "1.0.0"
-edition = "2021"
-description = "MONITOR · Rust 桌面取景器：本机摄像头 / iPhone USB 屏幕 / Android 屏幕镜像，自由调整屏幕比例"
-license = "MIT"
-
-[dependencies]
-eframe = { version = "0.31", default-features = false, features = ["glow", "default_fonts"] }
-egui = "0.31"
-image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
-chrono = "0.4"
-qrcode = { version = "0.14", default-features = false }
-rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
-rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
-tungstenite = { version = "0.26", default-features = false, features = ["handshake"] }
+[workspace]
+resolver = "2"
+members = ["src-tauri"]
 
 [profile.release]
 opt-level = 2

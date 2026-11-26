@@ -3,18 +3,24 @@
 set -e
 cd "$(dirname "$0")"
 
-# 工具链探测顺序：项目内置 .rust/（须已完整安装）→ 系统 cargo → ~/.rustup 工具链
-if [ -x ".rust/cargo/bin/cargo" ] && ls .rust/rustup/toolchains/*/bin/rustc >/dev/null 2>&1; then
-  export RUSTUP_HOME="$PWD/.rust/rustup"
-  export CARGO_HOME="$PWD/.rust/cargo"
-  export PATH="$PWD/.rust/cargo/bin:$PATH"
-elif ! command -v cargo >/dev/null 2>&1; then
-  for tc in "$HOME"/.rustup/toolchains/*/bin; do
-    if [ -x "$tc/cargo" ]; then
-      export PATH="$tc:$PATH"
-      break
-    fi
-  done
+export RUSTUP_HOME="${RUSTUP_HOME:-$HOME/.rustup}"
+# 优先复用项目内的 crate 缓存
+if [ -d ".rust/cargo/registry" ]; then
+  export CARGO_HOME="${CARGO_HOME:-$PWD/.rust/cargo}"
+fi
+
+# 工具链探测：项目内置 .rust/ → 系统 cargo → ~/.cargo → ~/.rustup 工具链
+if ! command -v cargo >/dev/null 2>&1; then
+  if [ -x "$HOME/.cargo/bin/cargo" ]; then
+    export PATH="$HOME/.cargo/bin:$PATH"
+  else
+    for tc in "$HOME"/.rustup/toolchains/*/bin; do
+      if [ -x "$tc/cargo" ]; then
+        export PATH="$tc:$PATH"
+        break
+      fi
+    done
+  fi
 fi
 
 if ! command -v cargo >/dev/null 2>&1; then
@@ -25,11 +31,6 @@ if ! command -v cargo >/dev/null 2>&1; then
   exit 1
 fi
 
-# 复用项目内的 crate 缓存（若存在），避免重新下载依赖
-if [ -z "${CARGO_HOME:-}" ] && [ -d ".rust/cargo/registry" ]; then
-  export CARGO_HOME="$PWD/.rust/cargo"
-fi
-
 if ! command -v ffmpeg >/dev/null 2>&1 && [ ! -x /opt/homebrew/bin/ffmpeg ] && [ ! -x /usr/local/bin/ffmpeg ]; then
   echo "提示：未找到 ffmpeg，取景/录像需要它：brew install ffmpeg"
 fi
@@ -37,5 +38,12 @@ fi
 echo "构建 MONITOR（release）…"
 cargo build --release
 
+BIN="./target/release/monitor-desktop"
+if [ ! -x "$BIN" ]; then
+  echo "构建产物缺失，请检查上面的错误信息。"
+  read -r -p "按回车键退出…"
+  exit 1
+fi
+
 echo "启动 MONITOR…"
-exec ./target/release/monitor-desktop
+exec "$BIN"

@@ -1,0 +1,21 @@
+[package]
+name = "monitor-desktop"
+version = "1.0.0"
+edition = "2021"
+description = "MONITOR · Tauri 桌面取景器：本机摄像头 / iPhone USB / Android 屏幕 / 手机无线（扫码），自由调整屏幕比例"
+license = "MIT"
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+chrono = "0.4"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
+qrcode = { version = "0.14", default-features = false, features = ["image"] }
+sha1 = "0.10"
+base64 = "0.22"
