@@ -1,7 +1,7 @@
 {
   "name": "monitor-desktop",
   "private": true,
-  "version": "1.0.1",
+  "version": "1.0.2",
   "description": "MONITOR · Tauri 桌面取景器",
   "scripts": {
     "tauri": "node scripts/tauri.mjs",

@@ -762,8 +762,9 @@ kbd {
 
 .grid-line {
   position: absolute;
-  background: rgba(233, 235, 228, 0.22);
-  mix-blend-mode: difference;
+  /* 不用 mix-blend-mode：它会把整个取景层拉进一个混合组，Windows 上
+     每帧重绘视频时容易诱发整块画面闪黑/闪白。半透明线条效果等价。 */
+  background: rgba(233, 235, 228, 0.26);
 }
 
 .grid-v { top: 0; bottom: 0; width: 1px; }
