@@ -7,14 +7,15 @@ use serde::Serialize;
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 const PHONE_PAGE: &str = include_str!("phone_page.html");
 
 /// 单条连接最多处理的请求数（逐帧上行会长期复用同一条连接）。
-const MAX_REQUESTS_PER_CONN: usize = 8192;
+/// 24 fps 下 8192 只够 5 分钟，用满就断连、重连会掉帧；放宽到约 45 分钟。
+const MAX_REQUESTS_PER_CONN: usize = 65536;
 
 /// 配对信息（前端展示二维码与地址）。
 #[derive(Clone, Serialize)]
@@ -51,9 +52,94 @@ fn now_stamp() -> String {
     chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
+/// 帧槽状态：最新一帧 + 版本号。生产者覆盖写，消费者按版本号取走。
+struct SlotState {
+    latest: Option<Vec<u8>>,
+    seq: u64,
+    closed: bool,
+    dropped: u64,
+}
+
+/// 无线推流只保留最新一帧。
+///
+/// 之前用无界 mpsc：桌面端一旦读得慢（解码、截图、切后台），队列会无限堆积，
+/// 画面就越来越滞后，甚至几十秒后才显示「刚才」的画面。实时取景里旧帧没有价值，
+/// 所以改成覆盖式帧槽：生产者永远写最新帧，消费者永远拿最新帧，队列长度恒为 1。
+struct FrameSlot {
+    state: Mutex<SlotState>,
+    cv: Condvar,
+}
+
+impl FrameSlot {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(SlotState { latest: None, seq: 0, closed: false, dropped: 0 }),
+            cv: Condvar::new(),
+        }
+    }
+
+    fn push(&self, data: Vec<u8>) {
+        if let Ok(mut s) = self.state.lock() {
+            if s.latest.is_some() {
+                // 上一帧还没被取走：直接覆盖，宁可丢帧也不让画面落后。
+                s.dropped += 1;
+            }
+            s.latest = Some(data);
+            s.seq = s.seq.wrapping_add(1);
+        }
+        self.cv.notify_all();
+    }
+
+    fn close(&self) {
+        if let Ok(mut s) = self.state.lock() {
+            s.closed = true;
+        }
+        self.cv.notify_all();
+    }
+
+    fn wait(&self, seen: &mut u64, timeout: Duration) -> Result<Vec<u8>, RecvTimeoutError> {
+        let deadline = Instant::now() + timeout;
+        let Ok(mut s) = self.state.lock() else {
+            return Err(RecvTimeoutError::Disconnected);
+        };
+        loop {
+            if s.seq != *seen {
+                *seen = s.seq;
+                if let Some(data) = s.latest.take() {
+                    return Ok(data);
+                }
+            }
+            if s.closed {
+                return Err(RecvTimeoutError::Disconnected);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(RecvTimeoutError::Timeout);
+            }
+            match self.cv.wait_timeout(s, deadline - now) {
+                Ok((guard, _)) => s = guard,
+                Err(_) => return Err(RecvTimeoutError::Disconnected),
+            }
+        }
+    }
+}
+
+/// 订阅端：与 mpsc::Receiver::recv_timeout 同形，方便调用方平滑迁移。
+pub struct FrameRx {
+    slot: Arc<FrameSlot>,
+    seen: u64,
+}
+
+impl FrameRx {
+    pub fn recv_timeout(&mut self, timeout: Duration) -> Result<Vec<u8>, RecvTimeoutError> {
+        self.slot.wait(&mut self.seen, timeout)
+    }
+}
+
 pub struct Wireless {
     tx: Sender<Event>,
-    sink: Mutex<Option<Sender<Vec<u8>>>>,
+    sink: Mutex<Option<Arc<FrameSlot>>>,
+    /// 还没有订阅者时（桌面还没开源）缓存的最新一帧：sink 一出现就清空，从不排队。
     /// 没有订阅者时保留的最新一帧（手机先连上、桌面后开源时立刻有画面）。
     latest: Mutex<Option<Vec<u8>>>,
     /// 本机自签证书 DER，供手机从 /cert 下载安装。
@@ -232,36 +318,35 @@ impl Wireless {
     }
 
     /// 订阅帧。之前没有订阅者时，把缓冲的最新一帧一并返回，桌面立刻能出画面。
-    pub fn subscribe(&self) -> (Receiver<Vec<u8>>, Option<Vec<u8>>) {
-        let (tx, rx) = channel();
+    pub fn subscribe(&self) -> (FrameRx, Option<Vec<u8>>) {
+        let slot = Arc::new(FrameSlot::new());
         let pending = self.latest.lock().ok().and_then(|mut l| l.take());
         if let Ok(mut sink) = self.sink.lock() {
-            *sink = Some(tx);
+            if let Some(old) = sink.replace(slot.clone()) {
+                // 换订阅者（重新开源）：旧槽里的等待线程要能退出。
+                old.close();
+            }
         }
-        (rx, pending)
+        (FrameRx { slot, seen: 0 }, pending)
     }
 
     pub fn clear_sink(&self) {
         if let Ok(mut sink) = self.sink.lock() {
-            *sink = None;
+            if let Some(slot) = sink.take() {
+                slot.close();
+            }
         }
         if let Ok(mut latest) = self.latest.lock() {
             *latest = None;
         }
     }
 
-    fn push_frame(&self, mut data: Vec<u8>) {
-        if let Ok(mut sink) = self.sink.lock() {
-            if let Some(tx) = sink.as_ref() {
-                match tx.send(data) {
-                    Ok(()) => return,
-                    Err(err) => {
-                        // 订阅者已退出：清掉 sink，退化为缓冲最新帧。
-                        *sink = None;
-                        data = err.0;
-                    }
-                }
-            }
+    /// 手机推来的每一帧都走这里：直接覆盖帧槽里的旧帧，绝不排队。
+    fn push_frame(&self, data: Vec<u8>) {
+        let slot = self.sink.lock().ok().and_then(|s| s.clone());
+        if let Some(slot) = slot {
+            slot.push(data);
+            return;
         }
         if let Ok(mut latest) = self.latest.lock() {
             *latest = Some(data);

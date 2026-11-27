@@ -462,8 +462,6 @@ function frameBrightness(bitmap) {
   }
 }
 
-/** 把一帧 JPEG 交给 <img> 直接合成：用 canvas 逐帧画大图在 WebView2 上偶尔会整块发黑，
- *  <img> 解码失败时浏览器会保留上一帧，画面只会停帧、不会闪黑。 */
 /** 等这张 <img> 真正解码好（onload 为主，decode() 只做加速，另加超时兜底）。 */
 function waitImageReady(image) {
   return new Promise(function (resolve) {
@@ -489,6 +487,8 @@ function waitImageReady(image) {
   });
 }
 
+/** 把一帧 JPEG 交给 <img> 直接合成：用 canvas 逐帧画大图在 WebView2 上偶尔会整块发黑，
+ *  <img> 解码失败时浏览器会保留上一帧，画面只会停帧、不会闪黑。 */
 async function showFrame(blob) {
   // 双缓冲：新帧先解码到背面那张 <img>，解码好再翻到前面。
   // 单张 <img> 每帧换 src 会在解码间隙短暂空掉，Windows 上就是一闪一闪的黑。
