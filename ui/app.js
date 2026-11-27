@@ -285,6 +285,8 @@ function layoutOverlays(layout, width, height, hasFrame) {
 function clearFrame() {
   state.hasFrame = false;
   state.frameFront = 'a';
+  state.lastBytes = null;
+  state.lum = -1;
   const urls = state.frameUrls;
   state.frameUrls = [];
   urls.forEach(function (url) {
