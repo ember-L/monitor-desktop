@@ -55,6 +55,7 @@ const state = {
   streamFailures: 0,
   decodeFailures: 0,
   darkFrames: 0,
+  darkStreak: 0,
   lum: -1,
   resets: 0,
   liveEvents: 0,
@@ -214,6 +215,10 @@ function sourceSize() {
   return { width: Math.max(1, width), height: Math.max(1, height) };
 }
 
+// 每帧都写 left/top/width/height 会让 WebView2 反复重排、重栅格化整个取景层，
+// 960 这种大图尤其明显（换一帧就黑一下）。只在几何真的变了才写。
+const geomCache = { crop: '', a: '', b: '' };
+
 function paint() {
   const view = dom.view;
   const crop = dom.viewCrop;
@@ -236,19 +241,40 @@ function paint() {
     const scale = layout.dest.w / Math.max(0.000001, layout.uv.w * source.width);
     const drawWidth = source.width * scale;
     const drawHeight = source.height * scale;
-    crop.style.left = Math.round(layout.dest.x) + 'px';
-    crop.style.top = Math.round(layout.dest.y) + 'px';
-    crop.style.width = Math.round(layout.dest.w) + 'px';
-    crop.style.height = Math.round(layout.dest.h) + 'px';
+    const cropKey = [
+      Math.round(layout.dest.x),
+      Math.round(layout.dest.y),
+      Math.round(layout.dest.w),
+      Math.round(layout.dest.h),
+    ].join(',');
+    if (geomCache.crop !== cropKey) {
+      geomCache.crop = cropKey;
+      crop.style.left = Math.round(layout.dest.x) + 'px';
+      crop.style.top = Math.round(layout.dest.y) + 'px';
+      crop.style.width = Math.round(layout.dest.w) + 'px';
+      crop.style.height = Math.round(layout.dest.h) + 'px';
+    }
+    const imgKey = [
+      drawWidth.toFixed(1),
+      drawHeight.toFixed(1),
+      Math.round(-uv.x * drawWidth),
+      Math.round(-uv.y * drawHeight),
+      state.mirror ? 'm' : 'n',
+    ].join(',');
     // 两张 <img> 都要摆好，背面那张解码完翻上来时位置才是对的。
-    [dom.viewImg, dom.viewImgB].forEach(function (image) {
+    [dom.viewImg, dom.viewImgB].forEach(function (image, index) {
       if (!image) return;
-      image.style.width = drawWidth.toFixed(1) + 'px';
-      image.style.height = drawHeight.toFixed(1) + 'px';
-      image.style.left = Math.round(-uv.x * drawWidth) + 'px';
-      image.style.top = Math.round(-uv.y * drawHeight) + 'px';
-      image.style.transform = state.mirror ? 'scaleX(-1)' : 'none';
-      image.style.zIndex = image === front ? '2' : '1';
+      const key = index === 0 ? 'a' : 'b';
+      if (geomCache[key] !== imgKey) {
+        geomCache[key] = imgKey;
+        image.style.width = drawWidth.toFixed(1) + 'px';
+        image.style.height = drawHeight.toFixed(1) + 'px';
+        image.style.left = Math.round(-uv.x * drawWidth) + 'px';
+        image.style.top = Math.round(-uv.y * drawHeight) + 'px';
+        image.style.transform = state.mirror ? 'scaleX(-1)' : 'none';
+      }
+      const z = image === front ? '2' : '1';
+      if (image.style.zIndex !== z) image.style.zIndex = z;
     });
   }
 
@@ -420,10 +446,22 @@ function pumpFrames() {
         state.pendingFrame = null;
         state.lastBytes = bytes;
         const blob = new Blob([bytes], { type: 'image/jpeg' });
-        // 每帧只解码一次：JPEG 直接交给背面那张 <img>。
-        // 早先每帧先用 createImageBitmap 解一遍算亮度、再交给 <img> 解第二遍，
-        // 960/1280 这种大帧下解码量翻倍 —— 这正是「960 闪、640 稳」的根源。
-        // 亮度改由 sampleLum() 每 600ms 采样一次（见下），不挡在显示路径上。
+        // 每帧只解码一次：JPEG 直接交给背面那张 <img>，亮度另走 16×9 缩图的廉价解码。
+        // 早先每帧先全尺寸 createImageBitmap 算亮度、再交给 <img> 解第二遍，
+        // 960/1280 大帧下解码量翻倍 —— 这是「960 闪、640 稳」的一个来源，已去掉。
+        const lum = await frameLum(blob);
+        if (lum >= 0) state.lum = lum;
+        if (lum >= 0 && lum < DARK_LEVEL) {
+          // 手机端偶发整块黑帧：挡掉，画面停在上一帧，而不是闪一下黑。
+          // 但只挡 DARK_HOLD 帧：真的把镜头捂住时，画面要能变黑，不能永久冻住。
+          state.darkFrames += 1;
+          state.darkStreak += 1;
+          if (state.darkStreak <= DARK_HOLD) {
+            updateHud();
+            continue;
+          }
+        }
+        state.darkStreak = 0;
         const result = await showFrame(blob);
         if (result === 'failed') {
           state.decodeFailures += 1;
@@ -440,39 +478,28 @@ function pumpFrames() {
   })();
 }
 
-/** 用 16×9 缩略图估平均亮度（0–255，失败返回 -1），挡住整块黑帧造成的闪黑。 */
+// 低于这个平均亮度（0–255）就当黑帧挡掉。
 const DARK_LEVEL = 4;
+
+// 连续黑帧最多挡这么多帧（23fps ≈ 0.35s），超过就当画面真的暗了，照常显示。
+const DARK_HOLD = 8;
+
+// 采样用的 16×9 离屏 canvas（懒创建）。
 const darkProbe = { canvas: null, ctx: null };
-/**
- * 每 600ms 从最近一帧的字节里取一次平均亮度，只用于 HUD 诊断。
- * 不在显示路径上做：显示路径每帧只解码一次（背面 <img>），
- * 而采样用 createImageBitmap 的 resize 选项小尺寸解码，几乎不占 CPU。
- * 注意不要改成「从已上屏的 <img> 上取像素」——WKWebView 里 img.decode()
- * 解析后立刻 drawImage 仍可能拿到空像素，实测会把每一帧都判成黑帧。
- */
-async function sampleLum() {
-  const bytes = state.lastBytes;
-  if (!bytes || document.hidden) return;
+
+// 廉价亮度采样：只解 16×9 的缩图（JPEG 支持缩尺寸解码，成本是全尺寸的零头）。
+// 不支持的引擎放弃采样，绝不退回每帧全尺寸解码 —— 那会把显示路径拖垮。
+let lumUnsupported = 0;
+
+async function frameLum(blob) {
+  if (typeof window.createImageBitmap !== 'function' || lumUnsupported > 3) return -1;
   let bitmap = null;
   try {
-    if (typeof window.createImageBitmap === 'function') {
-      try {
-        bitmap = await window.createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }), {
-          resizeWidth: 16,
-          resizeHeight: 9,
-        });
-      } catch (err) {
-        bitmap = await window.createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
-      }
-    }
-    const lum = frameBrightness(bitmap);
-    if (lum >= 0) {
-      state.lum = lum;
-      if (lum < DARK_LEVEL) state.darkFrames += 1;
-      updateHud();
-    }
+    bitmap = await window.createImageBitmap(blob, { resizeWidth: 16, resizeHeight: 9 });
+    return frameBrightness(bitmap);
   } catch (err) {
-    /* 采样失败不影响画面 */
+    lumUnsupported += 1;
+    return -1;
   } finally {
     if (bitmap && typeof bitmap.close === 'function') {
       try { bitmap.close(); } catch (err) { /* 已释放 */ }
@@ -1750,7 +1777,6 @@ function syncImmersiveFromWindow() {
 
 function startTimers() {
   // 亮度采样：只喂 HUD 诊断，不挡在显示路径上（600ms 一次，小尺寸解码）。
-  state.timers.lum = setInterval(function () { sampleLum(); }, 600);
 
   state.timers.clock = setInterval(function () {
     setText(dom.hudClock, formatClock(new Date()));

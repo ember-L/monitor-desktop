@@ -751,6 +751,8 @@ kbd {
   height: 100%;
   overflow: hidden;
   background: #000;
+  /* 取景层的重绘不外溢：换帧时别让整个窗口跟着重排 */
+  contain: paint;
 }
 
 /* 画面用 <img> 而不是 canvas：WebView2 上 canvas 每帧画大图会偶发整块发黑，
@@ -758,6 +760,10 @@ kbd {
 .view-crop {
   position: absolute;
   overflow: hidden;
+  /* 独立合成层：每帧换图只更新这层的纹理，不重栅格化整页。
+     WebView2 上 960 大图换帧时整块发黑，就是不提升图层导致的。 */
+  transform: translateZ(0);
+  will-change: transform;
 }
 
 .view-img {
