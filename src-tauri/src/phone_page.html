@@ -68,7 +68,7 @@
   </div>
   <div class="row"><label>镜像发送</label><input type="checkbox" id="mirror" style="width:22px;height:22px"></div>
   <button id="toggle" class="off">开始发送</button>
-  <div class="stats"><span>状态 <b id="st">未连接</b></span><span>发送 <b id="sf">0</b> fps</span><span>画面 <b id="dim">—</b></span></div>
+  <div class="stats"><span>状态 <b id="st">未连接</b></span><span>发送 <b id="sf">0</b> fps</span><span>画面 <b id="dim">—</b></span><span>跳过 <b id="sk">0</b></span></div>
 </div>
 <p class="hint">手机与电脑需在同一 Wi-Fi。首次打开若提示证书不受信任，请选择「继续访问」；想彻底不弹提示可<a href="/cert" style="color:#7ee2a8">安装证书</a>。<br>保持本页面在前台且屏幕常亮，锁屏或切后台会中断发送。</p>
 <p class="hint" id="note"></p>
@@ -77,11 +77,17 @@
 const $ = id => document.getElementById(id);
 const video = $("video"), badge = $("badge"), canvas = document.createElement("canvas");
 const ctx2d = canvas.getContext("2d");
+// 黑帧探测：把刚画好的画面缩到 16×9 读平均亮度。安卓上偶尔会抓到一帧全黑的
+// canvas（视频轨道瞬断、上下文被回收），这种帧发到电脑上就是一整块闪黑。
+const probe = document.createElement("canvas");
+probe.width = 16; probe.height = 9;
+const probeCtx = probe.getContext("2d", { willReadFrequently: true });
+const DARK_LEVEL = 4;   // 平均亮度低于此值视作黑帧（真正的暗场景仍在 10 以上）
 const token = new URLSearchParams(location.search).get("t") || "";
 const ua = navigator.userAgent;
 const platform = /iPhone|iPad|iPod/.test(ua) ? "iPhone" : /Android/.test(ua) ? "Android 手机" : "手机";
 let ws = null, stream = null, sending = false, timer = null, wakeLock = null;
-let sent = 0, devices = [], camIndex = 0, reconnectDelay = 1000;
+let sent = 0, skipped = 0, devices = [], camIndex = 0, reconnectDelay = 1000;
 // transport: "ws" = WSS 推流（首选）；"post" = 同源 HTTPS 逐帧上行（WSS 被证书/网络拦下时兜底）
 let transport = "ws", wsFails = 0, postFails = 0, switches = 0, posting = false;
 let autoStart = true;  // 用户手动「暂停发送」后不再自动开始
@@ -135,6 +141,20 @@ async function openCamera() {
   errShow("");
 }
 
+function isBlack() {
+  try {
+    probeCtx.drawImage(canvas, 0, 0, probe.width, probe.height);
+    const px = probeCtx.getImageData(0, 0, probe.width, probe.height).data;
+    const n = px.length / 4;
+    if (!n) return false;
+    let sum = 0;
+    for (let i = 0; i < px.length; i += 4) sum += (px[i] + px[i + 1] + px[i + 2]) / 3;
+    return sum / n < DARK_LEVEL;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function grab() {
   if (!(video.readyState >= 2 && video.videoWidth > 0)) return null;
   const w = video.videoWidth, h = video.videoHeight;
@@ -143,26 +163,30 @@ async function grab() {
   if ($("mirror").checked) { ctx2d.translate(w, 0); ctx2d.scale(-1, 1); }
   ctx2d.drawImage(video, 0, 0, w, h);
   ctx2d.restore();
+  if (isBlack()) { skipped++; $("sk").textContent = skipped; return null; }
   return new Promise(res => canvas.toBlob(res, "image/jpeg", 0.8));
 }
 
-/** 首选：每帧一个二进制 WebSocket 消息。 */
+/** 首选：每帧一个二进制 WebSocket 消息。串行抓帧再发送，避免多帧并发导致旧帧后到。 */
 function startLoop() {
   stopLoop();
   loopGen++;
   if (transport === "post") { startPost(); return; }
   const gen = loopGen;
-  const tick = () => {
-    if (gen !== loopGen || !sending || transport !== "ws") return;
-    const interval = 1000 / fps();
-    grab().then(blob => {
+  (async function tick() {
+    while (gen === loopGen && sending && transport === "ws") {
+      const t0 = Date.now();
+      if (!ws || ws.readyState !== 1) { await sleep(120); continue; }
+      if (ws.bufferedAmount > 1048576) { await sleep(40); continue; }
+      const blob = await grab();
+      if (gen !== loopGen || !sending) return;
       if (blob && ws && ws.readyState === 1 && ws.bufferedAmount < 1048576) {
         ws.send(blob); sent++; lastSent = Date.now();
       }
-    });
-    timer = setTimeout(tick, interval);
-  };
-  timer = setTimeout(tick, 60);
+      const wait = 1000 / fps() - (Date.now() - t0);
+      if (wait > 0) await sleep(wait);
+    }
+  })();
 }
 
 /** 重建发送循环：旧循环可能因为 iOS 把页面冻结而永远卡在 await 里。 */

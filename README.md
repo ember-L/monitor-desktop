@@ -118,6 +118,8 @@ docs/ui-spec.md    界面与交互规范
 
 画面链路：ffmpeg 或手机端直接产出 JPEG，后端只保留最新一帧，前端用 `fetch` 轮询本地 `GET /frame.jpg` 取单帧、`createImageBitmap` 解码后画到 canvas（每帧一个小请求，30 fps 左右）。**不要改回 multipart 长连接流**：WKWebView 打开 `multipart/x-mixed-replace` 的 `fetch` 后第一次 `read()` 直接 `TypeError: Load failed`，桌面端会一帧都收不到（`/stream` 端点仍保留给 curl、测试和旧客户端）。拍照直接落盘 JPEG，录像时才解码成 rawvideo 交给 libx264。
 
+手机无线画面防闪黑：手机页把每帧缩到 16×9 估平均亮度，抓到的全黑帧（安卓上偶发的空 canvas）直接丢掉并计入页面上的「跳过」；桌面端收到帧后同样再挡一次（16×9 缩略图平均亮度低于 4 就不上屏，`ui/app.js` 的 `isBlackFrame`）。手机页的发送循环是串行的：抓完一帧发出去再抓下一帧，避免多帧并发让旧帧后到，画面忽明忽暗。
+
 ## Windows 打包
 
 Windows 安装包（NSIS `.exe` + MSI）必须在 Windows 上构建：Tauri 打包器要调用 Windows 侧工具链（WiX / NSIS），macOS 上无法交叉生成安装包。代码已按平台适配：相机走 DirectShow，局域网 IP 走 `ipconfig`，素材目录是 `%USERPROFILE%\Videos\MONITOR`，用 `explorer` 打开目录，没有 `/dev/urandom` 时用混合随机源生成配对码。

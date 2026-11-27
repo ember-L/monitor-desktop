@@ -51,6 +51,7 @@ const state = {
   pollTimer: 0,
   streamFailures: 0,
   decodeFailures: 0,
+  darkFrames: 0,
   deleteArmed: '',
   immersive: false,
   zoomAt: 0,
@@ -378,6 +379,13 @@ function pumpFrames() {
           state.decodeFailures += 1;
           continue;
         }
+        if (isBlackFrame(bitmap)) {
+          // 偶发的全黑帧（手机端抓到空 canvas / 解码出错）直接丢掉：宁可少一帧，
+          // 也不要在画面上闪一下黑。
+          state.darkFrames += 1;
+          if (typeof bitmap.close === 'function') bitmap.close();
+          continue;
+        }
         state.decodeFailures = 0;
         state.streamFailures = 0;
         closeBitmap();
@@ -390,6 +398,30 @@ function pumpFrames() {
       state.decoding = false;
     }
   })();
+}
+
+/** 用 16×9 缩略图估平均亮度，挡住整块黑帧造成的闪黑。 */
+const darkProbe = { canvas: null, ctx: null };
+function isBlackFrame(bitmap) {
+  if (!bitmap) return true;
+  try {
+    if (!darkProbe.canvas) {
+      darkProbe.canvas = document.createElement('canvas');
+      darkProbe.canvas.width = 16;
+      darkProbe.canvas.height = 9;
+      darkProbe.ctx = darkProbe.canvas.getContext('2d', { willReadFrequently: true });
+    }
+    if (!darkProbe.ctx) return false;
+    darkProbe.ctx.drawImage(bitmap, 0, 0, 16, 9);
+    const px = darkProbe.ctx.getImageData(0, 0, 16, 9).data;
+    let sum = 0;
+    const n = px.length / 4;
+    if (!n) return false;
+    for (let i = 0; i < px.length; i += 4) sum += (px[i] + px[i + 1] + px[i + 2]) / 3;
+    return sum / n < 4;
+  } catch (err) {
+    return false;
+  }
 }
 
 async function decodeFrame(bytes) {
