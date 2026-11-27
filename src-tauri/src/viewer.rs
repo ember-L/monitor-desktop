@@ -8,7 +8,7 @@ use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 struct Latest {
     seq: u64,
@@ -71,6 +71,30 @@ impl Viewer {
         self.cv.notify_all();
     }
 
+    /// 取一帧；指定 since 时最多等 wait，直到出现帧号不同的新帧。
+    /// 前端用它做长轮询：请求发出后一有新帧立刻返回，比固定间隔轮询少等一整个间隔。
+    fn snapshot(&self, since: Option<u64>, wait: Duration) -> Option<(u64, Arc<Vec<u8>>)> {
+        let deadline = Instant::now() + wait;
+        let mut l = self.latest.lock().ok()?;
+        loop {
+            let fresh = match since {
+                Some(s) => s != l.seq,
+                None => true,
+            };
+            if fresh {
+                if let Some(jpeg) = &l.jpeg {
+                    return Some((l.seq, jpeg.clone()));
+                }
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return None;
+            }
+            let (guard, _) = self.cv.wait_timeout(l, deadline - now).ok()?;
+            l = guard;
+        }
+    }
+
     pub fn set_qr(&self, png: Vec<u8>) {
         if let Ok(mut q) = self.qr.lock() {
             *q = Some(Arc::new(png));
@@ -90,6 +114,8 @@ impl Viewer {
     }
 
     fn handle(&self, mut stream: TcpStream) {
+        // 本机回环也要关 Nagle：逐帧小响应攒包会让每帧多等几十毫秒。
+        let _ = stream.set_nodelay(true);
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         let mut rd = BufReader::new(match stream.try_clone() {
             Ok(s) => s,
@@ -106,19 +132,30 @@ impl Viewer {
         }
         // 单帧快照：给不支持长连接流式读取的 WebView 兜底轮询用。
         if path == "/frame.jpg" || path == "/frame" {
-            let jpeg = self.latest.lock().ok().and_then(|l| l.jpeg.clone());
-            match jpeg {
-                Some(bytes) => {
-                    let extra = [
-                        ("Cache-Control", "no-store".to_string()),
-                        ("Access-Control-Allow-Origin", "*".to_string()),
-                    ];
+            // v= 上一次拿到的帧号，wait= 最多等多久（毫秒）。
+            // 带 v 的请求会挂起到有新帧才返回：前端不用固定 30ms 空转一次，
+            // 既省掉平均一个轮询间隔的延迟，也少掉大量空请求。
+            let since = req.query_param("v").and_then(|v| v.parse::<u64>().ok());
+            let wait = req
+                .query_param("wait")
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(0)
+                .min(2_000);
+            let got = self.snapshot(since, Duration::from_millis(wait));
+            let mut extra = vec![("Access-Control-Allow-Origin", "*".to_string())];
+            extra.push(("Access-Control-Expose-Headers", "X-Frame-Seq".to_string()));
+            match got {
+                Some((seq, bytes)) => {
+                    extra.push(("X-Frame-Seq", seq.to_string()));
                     let _ = http::write_response(&mut stream, 200, "OK", "image/jpeg", &extra, &bytes);
+                }
+                None if since.is_some() => {
+                    // 等到超时也没有新帧：204 让前端立刻续上下一次等待，不算错误。
+                    let _ = http::write_response(&mut stream, 204, "No Content", "text/plain", &extra, b"");
                 }
                 None => {
                     // 404 也要带 CORS 头：否则 WKWebView 里 fetch 会直接抛 TypeError，
                     // 前端分不清「还没收到帧」和「取景服务挂了」。
-                    let extra = [("Access-Control-Allow-Origin", "*".to_string())];
                     let _ = http::write_response(&mut stream, 404, "Not Found", "text/plain", &extra, b"");
                 }
             }
@@ -412,6 +449,64 @@ mod tests {
 
         let missing = request(viewer.port, "GET /media/../secret HTTP/1.1\r\nHost: x\r\n\r\n");
         assert!(String::from_utf8_lossy(&missing).starts_with("HTTP/1.1 400 Bad Request"));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    fn header_of(raw: &[u8]) -> String {
+        let head_end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap_or(raw.len());
+        String::from_utf8_lossy(&raw[..head_end]).to_string()
+    }
+
+    #[test]
+    fn frame_long_poll_times_out_with_204() {
+        let root = temp_root("longpoll-empty");
+        let viewer = Viewer::start(root.clone()).unwrap();
+        let raw = request(viewer.port, "GET /frame.jpg?v=0&wait=120 HTTP/1.1\r\nHost: x\r\n\r\n");
+        let head = header_of(&raw);
+        assert!(head.starts_with("HTTP/1.1 204"), "{head}");
+        assert!(head.to_ascii_lowercase().contains("access-control-allow-origin: *"), "{head}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_long_poll_wakes_on_next_frame() {
+        let root = temp_root("longpoll-wake");
+        let viewer = Viewer::start(root.clone()).unwrap();
+        let first: Vec<u8> = vec![0xFF, 0xD8, 1, 2, 0xFF, 0xD9];
+        let second: Vec<u8> = vec![0xFF, 0xD8, 3, 4, 5, 0xFF, 0xD9];
+        viewer.set_frame(Arc::new(first));
+        let port = viewer.port;
+        let later = Arc::new(viewer);
+        let pusher = Arc::clone(&later);
+        let next = second.clone();
+        let h = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(120));
+            pusher.set_frame(Arc::new(next));
+        });
+        let start = Instant::now();
+        let raw = request(port, "GET /frame.jpg?v=1&wait=2000 HTTP/1.1\r\nHost: x\r\n\r\n");
+        let elapsed = start.elapsed();
+        h.join().unwrap();
+        let head = header_of(&raw);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(head.contains("X-Frame-Seq: 2"), "{head}");
+        assert!(raw.windows(second.len()).any(|w| w == second.as_slice()), "payload missing");
+        assert!(elapsed < Duration::from_millis(1500), "waited {elapsed:?}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn frame_without_version_returns_latest_immediately() {
+        let root = temp_root("longpoll-latest");
+        let viewer = Viewer::start(root.clone()).unwrap();
+        let jpeg: Vec<u8> = vec![0xFF, 0xD8, 9, 0xFF, 0xD9];
+        viewer.set_frame(Arc::new(jpeg.clone()));
+        let start = Instant::now();
+        let raw = request(viewer.port, "GET /frame.jpg?wait=2000 HTTP/1.1\r\nHost: x\r\n\r\n");
+        assert!(start.elapsed() < Duration::from_millis(500), "should not block");
+        let head = header_of(&raw);
+        assert!(head.starts_with("HTTP/1.1 200"), "{head}");
+        assert!(raw.windows(jpeg.len()).any(|w| w == jpeg.as_slice()), "payload missing");
         let _ = std::fs::remove_dir_all(&root);
     }
 }

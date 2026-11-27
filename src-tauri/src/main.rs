@@ -572,7 +572,9 @@ fn main() {
     var se = document.getElementById('stage-empty');
     var fps = document.getElementById('hud-fps');
     var st = document.getElementById('status-text');
-    send('ui', !!(se && se.hidden), 'stageEmptyHidden=' + (!!(se && se.hidden)) + ' fps=' + (fps ? fps.textContent : '?') + ' status=' + (st ? st.textContent : '?'));
+    var im = document.getElementById('view-img');
+    var hud = document.getElementById('hud-diag');
+    send('ui', !!(se && se.hidden), 'stageEmptyHidden=' + (!!(se && se.hidden)) + ' attr=' + (se ? se.hasAttribute('hidden') : '?') + ' display=' + (se ? getComputedStyle(se).display : '?') + ' img=' + (im ? im.naturalWidth + 'x' + im.naturalHeight : '?') + ' hud=' + (hud ? hud.textContent : '?') + ' fps=' + (fps ? fps.textContent : '?') + ' status=' + (st ? st.textContent : '?'));
   }, 24000);
   // 放大取景：点一下按钮，确认真实 WKWebView 里布局铺满、并且窗口进了系统全屏。
   setTimeout(function(){

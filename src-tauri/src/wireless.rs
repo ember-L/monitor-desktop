@@ -7,7 +7,7 @@ use serde::Serialize;
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, RecvTimeoutError, Sender};
+use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -662,6 +662,9 @@ fn serve_conn(w: Arc<Wireless>, cfg: Arc<rustls::ServerConfig>, stream: TcpStrea
     let peer = stream.peer_addr().map(|a| a.to_string()).unwrap_or_else(|_| "?".to_string());
     trace(&format!("accept {peer}"));
     w.note_accept(&peer);
+    // 关掉 Nagle：逐帧上传时每个小包都要立刻发出。开着的话，延迟会被
+    // 攒包机制额外拖 40ms 以上，24 fps 下体感就是明显的「慢半拍」。
+    let _ = stream.set_nodelay(true);
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
     let _ = stream.set_write_timeout(Some(Duration::from_secs(15)));
     let Ok(conn) = rustls::ServerConnection::new(cfg) else { return };
@@ -792,6 +795,8 @@ fn serve_conn(w: Arc<Wireless>, cfg: Arc<rustls::ServerConfig>, stream: TcpStrea
 fn ws_loop(w: Arc<Wireless>, mut ws: WsConn<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>) {
     let mut authed = false;
     let mut name: Option<String> = None;
+    // 本连接收到的帧数：随每帧回执发给手机，手机据此限制「在途帧」数量。
+    let mut frames_in: u64 = 0;
     loop {
         let msg = match ws.read_message() {
             Ok(Some(m)) => m,
@@ -803,6 +808,11 @@ fn ws_loop(w: Arc<Wireless>, mut ws: WsConn<rustls::StreamOwned<rustls::ServerCo
                     let len = data.len();
                     w.push_frame(data);
                     w.note_frame(len, true);
+                    frames_in += 1;
+                    // 逐帧回执：WebSocket 的 bufferedAmount 只反映本地缓冲，
+                    // 反映不了 Wi-Fi 上真正排队的帧。手机靠这个数字把在途帧控制在 2–3 帧，
+                    // 弱网时主动丢帧换实时性，而不是让画面越积越旧。
+                    let _ = ws.write_text(&format!("{{\"type\":\"ack\",\"n\":{frames_in}}}"));
                 }
             }
             WsMsg::Text(text) => {
@@ -859,6 +869,7 @@ fn ws_loop(w: Arc<Wireless>, mut ws: WsConn<rustls::StreamOwned<rustls::ServerCo
 mod tests {
     use super::*;
     use std::io::Write;
+    use std::sync::mpsc::channel;
 
     #[test]
     fn token_is_hex_and_not_empty() {
@@ -1019,7 +1030,7 @@ mod tests {
             eprintln!("跳过：无线服务不可用（{}）", info.hint);
             return;
         }
-        let (frames, pending) = w.subscribe();
+        let (mut frames, pending) = w.subscribe();
         assert!(pending.is_none(), "还没有帧时不应有缓冲帧");
 
         // 1. 手机页：正确 token 返回 HTML，错误 token 返回 403
@@ -1087,7 +1098,7 @@ mod tests {
             eprintln!("跳过：无线服务不可用（{}）", info.hint);
             return;
         }
-        let (frames, pending) = w.subscribe();
+        let (mut frames, pending) = w.subscribe();
         assert!(pending.is_none());
 
         let mut rd = connect(info.port);
@@ -1164,6 +1175,22 @@ mod tests {
         assert!(none.is_none(), "缓冲帧只交付一次");
     }
 
+    /// 慢消费者：只应该拿到最新一帧，中间帧直接丢弃（实时画面不排队）。
+    #[test]
+    fn drops_stale_frames_for_slow_consumers() {
+        let (tx, _rx) = channel();
+        let w = Wireless::new(tx);
+        let (mut frames, pending) = w.subscribe();
+        assert!(pending.is_none());
+        w.push_frame(vec![0xFF, 0xD8, 1, 0xFF, 0xD9]);
+        w.push_frame(vec![0xFF, 0xD8, 2, 0xFF, 0xD9]);
+        w.push_frame(vec![0xFF, 0xD8, 3, 0xFF, 0xD9]);
+        assert_eq!(frames.recv_timeout(Duration::from_secs(1)).unwrap(), vec![0xFF, 0xD8, 3, 0xFF, 0xD9]);
+        assert_eq!(frames.recv_timeout(Duration::from_millis(80)), Err(RecvTimeoutError::Timeout));
+        w.clear_sink();
+        assert_eq!(frames.recv_timeout(Duration::from_millis(80)), Err(RecvTimeoutError::Disconnected));
+    }
+
     /// 持续推流：一条 keep-alive 连接连推 200 帧，全部要被接受且顺序不乱。
     #[test]
     fn keeps_post_channel_healthy_under_sustained_load() {
@@ -1174,7 +1201,7 @@ mod tests {
             eprintln!("跳过：无线服务不可用（{}）", info.hint);
             return;
         }
-        let (frames, _pending) = w.subscribe();
+        let (mut frames, _pending) = w.subscribe();
         let mut rd = connect(info.port);
         let total = 200usize;
         for i in 0..total {

@@ -9,7 +9,7 @@ use std::net::TcpStream;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, Sender};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -452,7 +452,7 @@ pub fn spawn_android(gen: u64, serial: &str, tx: Sender<Event>) -> Result<Source
 /// 手机无线：WSS 推送的 JPEG 帧 → 统一的 Frame 事件。
 pub fn spawn_wireless(gen: u64, tx: Sender<Event>, wireless: Arc<Wireless>) -> Result<SourceHandle, String> {
     let stop = Arc::new(AtomicBool::new(false));
-    let (rx, buffered): (Receiver<Vec<u8>>, Option<Vec<u8>>) = wireless.subscribe();
+    let (rx, buffered) = wireless.subscribe();
     let _ = tx.send(Event::State { gen, state: SourceState::Starting });
     let handle = SourceHandle {
         stop: stop.clone(),
@@ -466,6 +466,7 @@ pub fn spawn_wireless(gen: u64, tx: Sender<Event>, wireless: Arc<Wireless>) -> R
         let mut live = false;
         // 手机先连上、桌面后开源时，先交付缓冲的最新一帧，不必等下一帧。
         let mut buffered = buffered;
+        let mut rx = rx;
         loop {
             if s.load(Ordering::SeqCst) {
                 break;

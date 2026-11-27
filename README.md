@@ -63,7 +63,7 @@ macOS 也可以直接双击 **`启动.command`**（首次自动 `cargo build --r
 
 上行通道有两条，页面会自动选：优先用 WSS 推流；若手机浏览器不接受自签证书导致 WSS 握手失败（iOS Safari 常见），页面会在同一端口改用同源 HTTPS 逐帧 POST 上传，画面照样能到桌面，只是帧率略低。想彻底避免证书提示，可在手机页或浏览器里打开 `/cert` 下载并信任该证书（macOS 也可用 `security add-trusted-cert`）。桌面端已连上但 6 秒内没收到画面时，会提示「手机已连接，但还没收到画面」，多数情况是手机页的相机权限没给或页面被切到后台。
 
-手机锁屏或切到别的 App 时，系统会冻结页面、暂停推流：页面回到前台会自动重建上行通道（WSS 连接假死则直接换一条新连接；逐帧 POST 每帧带 8 秒超时，卡住会自行重试），另有看门狗在连续 6 秒没送出画面时强制重启推流。桌面端连续 4 秒没收到帧，会把状态改成「等待手机画面」，不再让最后一帧冒充实时画面；手机恢复推流后自动回到实时状态。
+手机锁屏或切到别的 App 时，系统会冻结页面、暂停推流：页面回到前台会自动重建上行通道（WSS 连接假死则直接换一条新连接；逐帧 POST 每帧带 4 秒超时，卡住会自行重试），另有看门狗在连续 6 秒没送出画面时强制重启推流。桌面端连续 4 秒没收到帧，会把状态改成「等待手机画面」，不再让最后一帧冒充实时画面；手机恢复推流后自动回到实时状态。
 
 二维码里的地址始终来自当前网卡：换了 Wi-Fi、插上网线或开关 VPN 之后，点浮层里的「刷新地址」即可重新读取本机 IP（切回窗口时也会自动刷新一次）。电脑有多块网卡（比如同时连着 Wi-Fi 和虚拟网卡）时，「本机 IP」会变成下拉框，选手机真正能访问到的那个地址即可；二维码、端口与 token 都保持不变。
 
@@ -106,7 +106,7 @@ src-tauri/
   src/android.rs   adb 设备解析
   src/devices.rs   相机枚举（macOS avfoundation / Windows DirectShow）
   src/capture.rs   拍照（JPEG）/ 录像（MP4）/ 缩略图
-  src/viewer.rs    本地 127.0.0.1 取景服务：单帧 /frame.jpg（界面用这个）、MJPEG /stream、/media、/thumb、/qr
+  src/viewer.rs    本地 127.0.0.1 取景服务：单帧长轮询 /frame.jpg（界面用这个）、MJPEG /stream、/media、/thumb、/qr
   src/wireless.rs  局域网 HTTPS + WSS 推流、配对 token、二维码
   src/http.rs      手写 HTTP/1.1 与 WebSocket 帧协议
   src/phone_page.html  手机端页面（编进二进制）
@@ -116,9 +116,9 @@ docs/CONTRACT.md   前后端命令 / 事件 / 流协议契约
 docs/ui-spec.md    界面与交互规范
 ```
 
-画面链路：ffmpeg 或手机端直接产出 JPEG，后端只保留最新一帧，前端用 `fetch` 轮询本地 `GET /frame.jpg` 取单帧、`createImageBitmap` 解码后画到 canvas（每帧一个小请求，30 fps 左右）。**不要改回 multipart 长连接流**：WKWebView 打开 `multipart/x-mixed-replace` 的 `fetch` 后第一次 `read()` 直接 `TypeError: Load failed`，桌面端会一帧都收不到（`/stream` 端点仍保留给 curl、测试和旧客户端）。拍照直接落盘 JPEG，录像时才解码成 rawvideo 交给 libx264。
+画面链路：ffmpeg 或手机端直接产出 JPEG，后端给无线推流只留一个「最新帧槽」——新帧直接覆盖旧帧，慢消费者永远拿到最新那帧、不会排队补帧；前端用 `fetch` 长轮询本地 `GET /frame.jpg?v=<帧号>&wait=250`，有新帧立刻返回 200 + `X-Frame-Seq`，没有就 204 让前端马上续上下一次等待（不是固定间隔空转），完全没有帧才 404 退避。取到的 JPEG 交给 `<img>` 解码上屏（见下）。**不要改回 multipart 长连接流**：WKWebView 打开 `multipart/x-mixed-replace` 的 `fetch` 后第一次 `read()` 直接 `TypeError: Load failed`，桌面端会一帧都收不到（`/stream` 端点仍保留给 curl、测试和旧客户端）。拍照直接落盘 JPEG，录像时才解码成 rawvideo 交给 libx264。
 
-手机无线画面防闪黑：手机页把每帧缩到 16×9 估平均亮度，抓到的全黑帧（安卓上偶发的空 canvas）直接丢掉并计入页面上的「跳过」；桌面端收到帧后同样再挡一次（16×9 缩略图平均亮度低于 4 就不上屏，`ui/app.js` 的 `frameBrightness`）。手机页的发送循环是串行的：抓完一帧发出去再抓下一帧，避免多帧并发让旧帧后到，画面忽明忽暗。
+手机无线画面防闪黑：手机页每三帧把当前画面缩到 16×9 估一次平均亮度，抓到的全黑帧（安卓上偶发的空 canvas）直接丢掉并计入页面上的「跳过」；取样**从 `<video>` 直接缩图，不从大 canvas 回读**——Android 上 `drawImage(大 canvas)` 加 `getImageData` 要同步读回显存，960 分辨率每帧都做会把抓帧拖慢（这是「960 闪、640 稳」的一半原因）。桌面端**每帧只解码一次**（JPEG 直接交给背面那张 `<img>`）：早先是先用 `createImageBitmap` 解一遍算亮度、再交给 `<img>` 解第二遍，960/1280 大帧下解码量翻倍，这是另一半原因。亮度改由 `sampleLum()` 每 600ms 用 `createImageBitmap` 的小尺寸解码采一次，只喂 HUD，不挡在显示路径上；**不要改成从已上屏的 `<img>` 上取像素**——WKWebView 里 `decode()` 之后立刻 `drawImage` 仍可能拿到空像素，实测会把每一帧都判成黑帧，画面永远停在空状态。手机页的发送循环由电脑端的每帧回执（`{"type":"ack"}`）限流：在途帧超过 2 帧就把抓帧让出去（`requestAnimationFrame` 之外只 sleep 4ms），不再拿 `bufferedAmount` 猜对面收没收到；回执超 1.2 秒没等来（旧版桌面端完全不发回执）就自动放弃等待，不至于僵住；超过 0.7 秒还没回执的帧按「已丢弃」处理，一次丢包不会让在途数永久虚高。画质按回执往返时间自适应（0.42–0.8，越低越糊但越不容易积压），弱网时先降质量保帧率。
 
 桌面端显示画面用两张 `<img>` 双缓冲（`ui/index.html` 的 `#view-img` / `#view-img-b`，`ui/app.js` 的 `showFrame`）：新帧先解码到背面那张，`decode()` 完成才翻到前面，任何一次解码都不会让画面空一帧。不要改回单张 `<img>` 每帧换 `src`（解码间隙会短暂空白，实测 14 次截图里 13 次全黑），也不要改回 canvas 逐帧 `drawImage`（Windows WebView2 上偶尔整块发黑）。
 

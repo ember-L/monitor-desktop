@@ -68,7 +68,7 @@
   </div>
   <div class="row"><label>镜像发送</label><input type="checkbox" id="mirror" style="width:22px;height:22px"></div>
   <button id="toggle" class="off">开始发送</button>
-  <div class="stats"><span>状态 <b id="st">未连接</b></span><span>发送 <b id="sf">0</b> fps</span><span>画面 <b id="dim">—</b></span><span>跳过 <b id="sk">0</b></span></div>
+  <div class="stats"><span>状态 <b id="st">未连接</b></span><span>发送 <b id="sf">0</b> fps</span><span>画面 <b id="dim">—</b></span><span>画质 <b id="q">0.80</b></span><span>跳过 <b id="sk">0</b></span></div>
 </div>
 <p class="hint">手机与电脑需在同一 Wi-Fi。首次打开若提示证书不受信任，请选择「继续访问」；想彻底不弹提示可<a href="/cert" style="color:#7ee2a8">安装证书</a>。<br>保持本页面在前台且屏幕常亮，锁屏或切后台会中断发送。</p>
 <p class="hint" id="note"></p>
@@ -76,7 +76,7 @@
 "use strict";
 const $ = id => document.getElementById(id);
 const video = $("video"), badge = $("badge"), canvas = document.createElement("canvas");
-const ctx2d = canvas.getContext("2d");
+const ctx2d = canvas.getContext("2d", { alpha: false });
 // 黑帧探测：把刚画好的画面缩到 16×9 读平均亮度。安卓上偶尔会抓到一帧全黑的
 // canvas（视频轨道瞬断、上下文被回收），这种帧发到电脑上就是一整块闪黑。
 const probe = document.createElement("canvas");
@@ -93,12 +93,68 @@ let transport = "ws", wsFails = 0, postFails = 0, switches = 0, posting = false;
 let autoStart = true;  // 用户手动「暂停发送」后不再自动开始
 // 发送循环代号：每次重建循环加一，旧循环（可能卡在 await fetch 里）在下一个边界自行退出。
 let loopGen = 0, lastSent = Date.now(), hiddenAt = 0;
+// 实时性控制
+// 画质自适应：Wi-Fi 好时 0.8，弱网时降到 0.42 换帧率。JPEG 字节数直接决定空中时间。
+let quality = 0.8, lastAdapt = 0, qWarned = false;
+// 在途帧（已发未回执）：只压 2-3 帧在路上，弱网下主动丢帧而不是排队。
+let sentFrames = 0, ackedFrames = 0, lastAckAt = Date.now(), pendingSends = [], rttEwma = 0;
 
 function badgeSet(text, cls) { badge.textContent = text; badge.className = cls || ""; $("st").textContent = text; }
 function errShow(msg) { const e = $("err"); e.innerHTML = msg || ""; e.style.display = msg ? "block" : "none"; }
 function note(msg) { const n = $("note"); if (n) n.textContent = msg || ""; }
 function fps() { return Math.max(1, parseInt($("fps").value, 10) || 24); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
+
+// 在途帧的时间窗：超过这么久还没回执的帧就当丢了（未必是丢了，也可能只是慢，
+// 但对实时传输来说 0.7 秒的帧本来也没用）。不这么算，一次丢包会让「在途」
+// 永久虚高，发送循环就一直以为自己被卡住。
+const PENDING_WINDOW = 700;
+
+function prunePending() {
+  const cut = Date.now() - PENDING_WINDOW;
+  while (pendingSends.length && pendingSends[0] < cut) pendingSends.shift();
+}
+function inFlight() { prunePending(); return pendingSends.length; }
+
+/** 回执到达：更新统计，并用「发出→回执」的时间估一帧的往返延迟。 */
+function onAck(n) {
+  if (typeof n !== "number" || !isFinite(n)) return;
+  if (n > ackedFrames) ackedFrames = n;
+  lastAckAt = Date.now();
+  const sentAt = pendingSends.shift();
+  // 只采信没超窗的样本：否则一次丢包会把 RTT 抬到 700ms 以上，画质被白白压低。
+  if (!sentAt || Date.now() - sentAt > PENDING_WINDOW) return;
+  const rtt = Date.now() - sentAt;
+  rttEwma = rttEwma ? rttEwma * 0.8 + rtt * 0.2 : rtt;
+  adaptQuality(rttEwma, 260, 110);
+}
+
+/**
+ * 按实测延迟调 JPEG 画质。
+ * 无线链路的瓶颈几乎总是「每帧字节数 × 帧率」：降画质比降帧率划算，
+ * 画面还是流畅的，只是细节少一点，而排队造成的「慢半拍」会立刻消失。
+ */
+function adaptQuality(rtt, hi, lo) {
+  const now = Date.now();
+  if (now - lastAdapt < 700) return;
+  let q = quality;
+  if (rtt > hi) q -= 0.08;
+  else if (rtt < lo) q += 0.04;
+  q = Math.max(0.42, Math.min(0.8, q));
+  if (Math.abs(q - quality) < 0.01) return;
+  quality = Math.round(q * 100) / 100;
+  lastAdapt = now;
+  const qEl = $("q");
+  if (qEl) qEl.textContent = quality.toFixed(2);
+  // 只在跨过明显阈值时提示一次，避免刷屏
+  if (quality <= 0.62 && !qWarned) {
+    qWarned = true;
+    note("Wi-Fi 偏弱：已自动降低画质以保持画面流畅");
+  } else if (quality >= 0.78 && qWarned) {
+    qWarned = false;
+    note("");
+  }
+}
 function setToggle(on) {
   $("toggle").textContent = on ? "暂停发送" : "开始发送";
   $("toggle").className = on ? "" : "off";
@@ -141,9 +197,16 @@ async function openCamera() {
   errShow("");
 }
 
+let probeTick = 0;
 function isBlack() {
+  // 每三帧查一次就够：真出黑帧时是连续成片的，抽样不会漏。
+  // 取样从 video 直接缩到 16×9，绝不从大 canvas 回读 —— Android 上
+  // drawImage(大 canvas) + getImageData 要同步读回显存，960 这种分辨率
+  // 每帧都做会把抓帧拖慢（用户实测 960 闪、640 稳，差别就在这一次回读）。
+  if (probeTick++ % 3 !== 0) return false;
   try {
-    probeCtx.drawImage(canvas, 0, 0, probe.width, probe.height);
+    if (!(video.readyState >= 2 && video.videoWidth > 0)) return false;
+    probeCtx.drawImage(video, 0, 0, probe.width, probe.height);
     const px = probeCtx.getImageData(0, 0, probe.width, probe.height).data;
     const n = px.length / 4;
     if (!n) return false;
@@ -164,7 +227,7 @@ async function grab() {
   ctx2d.drawImage(video, 0, 0, w, h);
   ctx2d.restore();
   if (isBlack()) { skipped++; $("sk").textContent = skipped; return null; }
-  return new Promise(res => canvas.toBlob(res, "image/jpeg", 0.8));
+  return new Promise(res => canvas.toBlob(res, "image/jpeg", quality));
 }
 
 /** 首选：每帧一个二进制 WebSocket 消息。串行抓帧再发送，避免多帧并发导致旧帧后到。 */
@@ -177,10 +240,17 @@ function startLoop() {
     while (gen === loopGen && sending && transport === "ws") {
       const t0 = Date.now();
       if (!ws || ws.readyState !== 1) { await sleep(120); continue; }
-      if (ws.bufferedAmount > 1048576) { await sleep(40); continue; }
+      // 只允许 2 帧在途：TCP 缓冲空着不代表对面已经收下，等回执才准。
+      // 回执 1.5 秒没来（旧版电脑端不回执）就不再等，免得画面僵住。
+      if (inFlight() > 2 && Date.now() - lastAckAt < 1200) { await sleep(4); continue; }
+      // 兜底：TLS/内核发送缓冲堆积太多时，先别抓新帧（抓帧是最贵的一步）。
+      if (ws.bufferedAmount > 524288) { await sleep(20); continue; }
       const blob = await grab();
       if (gen !== loopGen || !sending) return;
-      if (blob && ws && ws.readyState === 1 && ws.bufferedAmount < 1048576) {
+      if (blob && ws && ws.readyState === 1) {
+        pendingSends.push(Date.now());
+        if (pendingSends.length > 32) pendingSends.shift();
+        sentFrames++;
         ws.send(blob); sent++; lastSent = Date.now();
       }
       const wait = 1000 / fps() - (Date.now() - t0);
@@ -210,12 +280,15 @@ async function startPost() {
         const url = "/frame?t=" + encodeURIComponent(token) + "&name=" + encodeURIComponent(deviceName());
         // 单帧超时：网络被系统挂起时 fetch 可能永远不返回，不设上限整个循环会僵死。
         const ac = new AbortController();
-        const to = setTimeout(() => { try { ac.abort(); } catch (e) {} }, 8000);
+        // 4 秒足够推完一帧；超时太久会让整个循环僵住，反而是稳定性问题。
+        const to = setTimeout(() => { try { ac.abort(); } catch (e) {} }, 4000);
         try {
           const r = await fetch(url, { method: "POST", cache: "no-store", headers: { "Content-Type": "image/jpeg" }, body: blob, signal: ac.signal });
           if (r.status === 403) { errShow("配对码无效：请重新扫描电脑上的二维码。"); sending = false; setToggle(false); break; }
           if (!r.ok) throw new Error("电脑返回 " + r.status);
           sent++; postFails = 0; lastSent = Date.now();
+          // 兜底通道没有回执：用请求往返时间估链路状况，一样自适应画质。
+          adaptQuality(Date.now() - t0, 600, 160);
           if (badge.textContent !== "已连接") { badgeSet("已连接", "ok"); note(""); }
         } finally { clearTimeout(to); }
       } catch (e) {
@@ -255,6 +328,8 @@ function connect() {
   sock.onopen = () => {
     if (ws !== sock) return;
     reconnectDelay = 1000; wsFails = 0;
+    // 回执计数按连接计：新连接从 0 开始，和电脑端的每连接计数对齐。
+    sentFrames = 0; ackedFrames = 0; pendingSends = []; lastAckAt = Date.now(); rttEwma = 0;
     badgeSet("已连接", "ok");
     errShow("");
     sock.send(JSON.stringify({ type: "hello", name: deviceName(), token }));
@@ -271,6 +346,13 @@ function connect() {
     badgeSet("重连中…", "err");
     setTimeout(connect, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 1.6, 8000);
+  };
+  sock.onmessage = (ev) => {
+    if (ws !== sock || typeof ev.data !== "string") return;
+    try {
+      const m = JSON.parse(ev.data);
+      if (m && m.type === "ack") onAck(m.n);
+    } catch (e) {}
   };
   sock.onerror = () => { try { sock.close(); } catch (e) {} };
 }

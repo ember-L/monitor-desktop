@@ -46,6 +46,7 @@ const state = {
   frameUrls: [],
   layout: null,
   pendingFrame: null,
+  lastBytes: null,
   decoding: false,
   streamAbort: null,
   streamToken: 0,
@@ -62,7 +63,7 @@ const state = {
   zoomAt: 0,
   busy: { devices: false, photo: false, record: false, pair: false, viewer: false },
   wireless: { open: false, connected: false, url: '', info: null },
-  timers: { clock: 0, rec: 0, refresh: 0, ratio: 0, deleteArm: 0, wirelessHint: 0, frameWatch: 0, wirelessDiag: 0, zoomSync: 0 },
+  timers: { clock: 0, rec: 0, refresh: 0, ratio: 0, deleteArm: 0, wirelessHint: 0, frameWatch: 0, wirelessDiag: 0, zoomSync: 0, lum: 0 },
 };
 
 /* ------------------------------------------------------------------ */
@@ -337,6 +338,9 @@ function connectStream() {
   const token = state.streamToken;
   const base = snapshotUrl(state.info.streamUrl);
   let inFlight = false;
+  // 上一次拿到的帧号。带上它请求会挂起到有新帧才返回（长轮询），
+  // 不再固定 30ms 空转：省掉轮询间隔带来的延迟，也少掉大量空请求。
+  let seq = -1;
 
   async function tick() {
     if (token !== state.streamToken || !state.source) return;
@@ -347,20 +351,29 @@ function connectStream() {
     inFlight = true;
     const controller = new AbortController();
     state.streamAbort = controller;
-    let next = 30;
+    let next = 0;
     try {
-      const url = base + (base.indexOf('?') >= 0 ? '&' : '?') + 't=' + Date.now();
+      let url = base;
+      if (seq >= 0) url += (base.indexOf('?') >= 0 ? '&' : '?') + 'v=' + seq + '&wait=250';
       const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
       if (token !== state.streamToken) return;
-      if (response.status === 404) {
+      if (response.status === 204) {
+        // 等到超时也没有新帧：立刻续上下一次等待，不做空转
+        next = 0;
+      } else if (response.status === 404) {
         // 设备已连上但还没有帧：稍等再试
         next = 120;
       } else if (!response.ok) {
         throw new Error('画面服务返回 ' + response.status);
       } else {
+        const header = response.headers.get('x-frame-seq');
+        const got = header === null ? NaN : Number(header);
+        if (Number.isFinite(got)) seq = got;
         const buffer = await response.arrayBuffer();
         if (token !== state.streamToken) return;
         if (buffer.byteLength) queueFrame(new Uint8Array(buffer));
+        // 服务端没给帧号（旧版本）：退回固定间隔轮询，避免反复取同一帧空转。
+        next = Number.isFinite(got) ? 0 : 30;
       }
     } catch (err) {
       if (controller.signal.aborted) return;
@@ -403,31 +416,19 @@ function pumpFrames() {
       while (state.pendingFrame) {
         const bytes = state.pendingFrame;
         state.pendingFrame = null;
+        state.lastBytes = bytes;
         const blob = new Blob([bytes], { type: 'image/jpeg' });
-        const bitmap = await decodeBitmap(blob);
-        if (!bitmap) {
+        // 每帧只解码一次：JPEG 直接交给背面那张 <img>。
+        // 早先每帧先用 createImageBitmap 解一遍算亮度、再交给 <img> 解第二遍，
+        // 960/1280 这种大帧下解码量翻倍 —— 这正是「960 闪、640 稳」的根源。
+        // 亮度改由 sampleLum() 每 600ms 采样一次（见下），不挡在显示路径上。
+        const result = await showFrame(blob);
+        if (result === 'failed') {
           state.decodeFailures += 1;
           continue;
         }
-        const lum = frameBrightness(bitmap);
-        const drop = function () {
-          if (typeof bitmap.close === 'function') {
-            try { bitmap.close(); } catch (err) { /* 已释放 */ }
-          }
-        };
-        if (lum >= 0 && lum < DARK_LEVEL) {
-          // 偶发的全黑帧（手机端抓到空 canvas / 解码出错）直接丢掉：宁可少一帧，
-          // 也不要在画面上闪一下黑。
-          state.darkFrames += 1;
-          drop();
-          updateHud();
-          continue;
-        }
-        state.lum = lum;
         state.decodeFailures = 0;
         state.streamFailures = 0;
-        drop();
-        await showFrame(blob);
         if (state.status === 'connecting') setStatus('live');
         if (dom.stageEmpty) setHidden(dom.stageEmpty, true);
       }
@@ -440,6 +441,43 @@ function pumpFrames() {
 /** 用 16×9 缩略图估平均亮度（0–255，失败返回 -1），挡住整块黑帧造成的闪黑。 */
 const DARK_LEVEL = 4;
 const darkProbe = { canvas: null, ctx: null };
+/**
+ * 每 600ms 从最近一帧的字节里取一次平均亮度，只用于 HUD 诊断。
+ * 不在显示路径上做：显示路径每帧只解码一次（背面 <img>），
+ * 而采样用 createImageBitmap 的 resize 选项小尺寸解码，几乎不占 CPU。
+ * 注意不要改成「从已上屏的 <img> 上取像素」——WKWebView 里 img.decode()
+ * 解析后立刻 drawImage 仍可能拿到空像素，实测会把每一帧都判成黑帧。
+ */
+async function sampleLum() {
+  const bytes = state.lastBytes;
+  if (!bytes || document.hidden) return;
+  let bitmap = null;
+  try {
+    if (typeof window.createImageBitmap === 'function') {
+      try {
+        bitmap = await window.createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }), {
+          resizeWidth: 16,
+          resizeHeight: 9,
+        });
+      } catch (err) {
+        bitmap = await window.createImageBitmap(new Blob([bytes], { type: 'image/jpeg' }));
+      }
+    }
+    const lum = frameBrightness(bitmap);
+    if (lum >= 0) {
+      state.lum = lum;
+      if (lum < DARK_LEVEL) state.darkFrames += 1;
+      updateHud();
+    }
+  } catch (err) {
+    /* 采样失败不影响画面 */
+  } finally {
+    if (bitmap && typeof bitmap.close === 'function') {
+      try { bitmap.close(); } catch (err) { /* 已释放 */ }
+    }
+  }
+}
+
 function frameBrightness(bitmap) {
   if (!bitmap) return -1;
   try {
@@ -493,14 +531,14 @@ async function showFrame(blob) {
   // 双缓冲：新帧先解码到背面那张 <img>，解码好再翻到前面。
   // 单张 <img> 每帧换 src 会在解码间隙短暂空掉，Windows 上就是一闪一闪的黑。
   const back = state.frameFront === 'a' ? dom.viewImgB : dom.viewImg;
-  if (!back) return;
+  if (!back) return 'failed';
   const url = URL.createObjectURL(blob);
   back.src = url;
   const ready = await waitImageReady(back);
   if (!ready) {
     // 解码失败：留着上一帧继续显示，别把画面清空
     setTimeout(function () { URL.revokeObjectURL(url); }, 0);
-    return;
+    return 'failed';
   }
   state.frameUrls.push(url);
   while (state.frameUrls.length > 3) {
@@ -510,29 +548,7 @@ async function showFrame(blob) {
   state.frameFront = state.frameFront === 'a' ? 'b' : 'a';
   state.hasFrame = true;
   paint();
-}
-
-async function decodeBitmap(blob) {
-  if (typeof window.createImageBitmap === 'function') {
-    try {
-      return await window.createImageBitmap(blob);
-    } catch (err) {
-      /* 解码失败：跳过这一帧 */
-    }
-  }
-  return await new Promise(function (resolve) {
-    const url = URL.createObjectURL(blob);
-    const image = new Image();
-    image.onload = function () {
-      URL.revokeObjectURL(url);
-      resolve(image);
-    };
-    image.onerror = function () {
-      URL.revokeObjectURL(url);
-      resolve(null);
-    };
-    image.src = url;
-  });
+  return 'shown';
 }
 
 /* ------------------------------------------------------------------ */
@@ -1731,6 +1747,9 @@ function syncImmersiveFromWindow() {
 /* ------------------------------------------------------------------ */
 
 function startTimers() {
+  // 亮度采样：只喂 HUD 诊断，不挡在显示路径上（600ms 一次，小尺寸解码）。
+  state.timers.lum = setInterval(function () { sampleLum(); }, 600);
+
   state.timers.clock = setInterval(function () {
     setText(dom.hudClock, formatClock(new Date()));
   }, 500);

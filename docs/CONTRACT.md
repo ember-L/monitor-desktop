@@ -39,30 +39,24 @@
 | `wireless` | `{ connected:boolean, name:string\|null, hint:string\|null }` |
 | `notice` | `{ text:string, level:"info"\|"error" }` |
 
-## 3. 画面传输：本地 MJPEG-over-fetch
+## 3. 画面传输：本地单帧长轮询
 
-`app_info.streamUrl` = `http://127.0.0.1:PORT/stream`（每帧带 Content-Length 的 multipart）。
+`app_info.streamUrl` = `http://127.0.0.1:PORT/frame.jpg`（每次响应都是一张完整 JPEG）。
 
-前端用 `fetch(streamUrl)` + `response.body.getReader()` 解析：
+请求带两个查询参数：
 
-```
---frame\r\n
-Content-Type: image/jpeg\r\n
-Content-Length: <N>\r\n
-\r\n
-<N 字节 JPEG>
-\r\n
-```
+- `v`：上一次拿到的帧号（来自响应头 `X-Frame-Seq`）。首次请求可以不带，或带 `-1`；解析不出数字时服务端按「没有旧帧」处理，立刻返回当前最新帧。
+- `wait`：最长挂起毫秒数，服务端上限 2000，前端用 250。
 
-解析规则（必须容错）：
-1. 累积字节到缓冲区，用 `\r\n\r\n` 分隔头部与载荷；
-2. 头部缺 Content-Length 时，回退到按 JPEG SOI(`FF D8`) / EOI(`FF D9`) 扫描；
-3. 载荷读满 N 字节后即为一帧，交给 `createImageBitmap(new Blob([bytes],{type:"image/jpeg"}))`，
-   `ctx.drawImage(bitmap, ...)` 到画布，`bitmap.close()`；
-4. 解码失败跳过该帧，不断流；
-5. 连接断开（源切换/暂停）后在 300ms 后重连；切源时 `gen` 变化应立刻重连并丢弃旧帧。
+响应：
 
-**不要**用 `<img src=".../stream">`（WebKit 不支持 multipart MJPEG）。
+- `200` + `image/jpeg`：头里带 `X-Frame-Seq: <n>`（单调递增）与 CORS 头（`Access-Control-Allow-Origin: *`、`Access-Control-Expose-Headers: X-Frame-Seq`），前端把 `n` 写进下一次的 `v`。
+- `204 No Content`：带了 `v`，但 `wait` 内没有新帧。这不是错误，前端立刻发起下一次等待（长轮询的「空转」是零成本的）。
+- `404`：当前没有任何帧（还没连上源、或已停止），前端退避约 120ms 再试。
+
+前端解析：`createImageBitmap(new Blob([bytes],{type:"image/jpeg"}))` → `ctx.drawImage(bitmap, ...)` 到画布 → `bitmap.close()`；解码失败跳过该帧，不断流；切源时 `gen` 变化立刻 abort 在途请求并丢弃旧帧。
+
+**不要**把这里改回 `fetch` + `multipart/x-mixed-replace`（`/stream`）：WKWebView 打开该流后第一次 `read()` 直接 `TypeError: Load failed`，一帧都收不到。`/stream` 端点仅为 curl、测试与旧客户端保留。
 
 ## 4. 其他 HTTP 端点（只读）
 
@@ -76,7 +70,7 @@ Content-Length: <N>\r\n
 - 纯逻辑（比例布局、MJPEG 解析、格式化）必须抽成可 import 的模块以便测试。
 ## 6. 实现状态
 
-- 后端（`src-tauri/src/`）：全部命令与事件已实现，`cargo test` 27 项通过（含真实 ffmpeg 录像、MJPEG 流、HTTP Range、HTTPS + WSS 手机推流端到端）。
+- 后端（`src-tauri/src/`）：全部命令与事件已实现，`cargo test` 39 项通过（含真实 ffmpeg 录像、MJPEG 流、HTTP Range、HTTPS + WSS 手机推流端到端）。
 - 前端（`ui/`）：静态实现，`node --test ui/tests/*.test.mjs` 46 项通过。
 - 打包：`pnpm tauri build` 产出 `target/release/bundle/macos/MONITOR.app`。
 
