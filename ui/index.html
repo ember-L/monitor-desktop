@@ -131,7 +131,12 @@
 
     <section class="stage-wrap" aria-label="取景画面">
       <div class="stage" id="stage">
-        <canvas class="view" id="view" width="800" height="600" aria-label="实时画面"></canvas>
+        <div class="view" id="view" aria-label="实时画面">
+          <div class="view-crop" id="view-crop" hidden>
+            <img class="view-img" id="view-img" alt="" decoding="async" draggable="false" />
+            <img class="view-img" id="view-img-b" alt="" aria-hidden="true" decoding="async" draggable="false" />
+          </div>
+        </div>
 
         <div class="stage-grid" id="stage-grid" aria-hidden="true">
           <span class="grid-line grid-v grid-v1"></span>

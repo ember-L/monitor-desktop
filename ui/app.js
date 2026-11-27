@@ -41,7 +41,9 @@ const state = {
   captures: [],
   capturesDir: '',
   activeCapture: null,
-  lastBitmap: null,
+  hasFrame: false,
+  frameFront: 'a',
+  frameUrls: [],
   layout: null,
   pendingFrame: null,
   decoding: false,
@@ -53,8 +55,6 @@ const state = {
   decodeFailures: 0,
   darkFrames: 0,
   lum: -1,
-  paintedLum: -1,
-  renderBlack: 0,
   resets: 0,
   liveEvents: 0,
   deleteArmed: '',
@@ -62,7 +62,7 @@ const state = {
   zoomAt: 0,
   busy: { devices: false, photo: false, record: false, pair: false, viewer: false },
   wireless: { open: false, connected: false, url: '', info: null },
-  timers: { clock: 0, rec: 0, refresh: 0, ratio: 0, deleteArm: 0, wirelessHint: 0, frameWatch: 0, wirelessDiag: 0, zoomSync: 0, diag: 0 },
+  timers: { clock: 0, rec: 0, refresh: 0, ratio: 0, deleteArm: 0, wirelessHint: 0, frameWatch: 0, wirelessDiag: 0, zoomSync: 0 },
 };
 
 /* ------------------------------------------------------------------ */
@@ -139,7 +139,7 @@ function applyStatus() {
 
   const busy = state.status === 'connecting';
   if (dom.stage) dom.stage.classList.toggle('is-busy', busy);
-  if (dom.stageEmpty) setHidden(dom.stageEmpty, state.status === 'live' && !!state.lastBitmap);
+  if (dom.stageEmpty) setHidden(dom.stageEmpty, state.status === 'live' && state.hasFrame);
 
   let title = '还没有画面';
   let detail = '在左侧选择一个设备开始取景。';
@@ -149,7 +149,7 @@ function applyStatus() {
   } else if (state.status === 'error') {
     title = '画面中断';
     detail = state.statusDetail || '请重新选择设备，或点击「刷新」重新枚举。';
-  } else if (state.status === 'live' && !state.lastBitmap) {
+  } else if (state.status === 'live' && !state.hasFrame) {
     title = '等待第一帧…';
     detail = '设备已连接，正在接收画面。';
   }
@@ -168,9 +168,7 @@ function updateHud() {
   setText(dom.hudFps, formatFps(state.frame.fps));
   if (dom.hudDiag) {
     const parts = ['亮度 ' + (state.lum >= 0 ? Math.round(state.lum) : '—')];
-    if (state.paintedLum >= 0) parts.push('上屏 ' + Math.round(state.paintedLum));
     if (state.darkFrames) parts.push('丢黑 ' + state.darkFrames);
-    if (state.renderBlack) parts.push('渲染黑 ' + state.renderBlack);
     if (state.resets > 3) parts.push('重置 ' + state.resets);
     setText(dom.hudDiag, parts.join(' · '));
   }
@@ -202,53 +200,58 @@ function canvasBox() {
   return { width: Math.max(1, rect.width), height: Math.max(1, rect.height) };
 }
 
+function frontImage() {
+  return state.frameFront === 'b' ? dom.viewImgB : dom.viewImg;
+}
+
 function sourceSize() {
-  const bitmap = state.lastBitmap;
-  const width = state.frame.width > 0 ? state.frame.width : bitmap ? bitmap.width : 16;
-  const height = state.frame.height > 0 ? state.frame.height : bitmap ? bitmap.height : 9;
+  const image = frontImage();
+  const naturalWidth = image && image.naturalWidth ? image.naturalWidth : 0;
+  const naturalHeight = image && image.naturalHeight ? image.naturalHeight : 0;
+  const width = state.frame.width > 0 ? state.frame.width : naturalWidth || 16;
+  const height = state.frame.height > 0 ? state.frame.height : naturalHeight || 9;
   return { width: Math.max(1, width), height: Math.max(1, height) };
 }
 
 function paint() {
-  const canvas = dom.view;
-  if (!canvas) return;
+  const view = dom.view;
+  const crop = dom.viewCrop;
+  const front = frontImage();
+  if (!view || !crop || !front) return;
   const box = canvasBox();
-  const dpr = Math.min(window.devicePixelRatio || 1, 2);
-  const pixelWidth = Math.max(1, Math.round(box.width * dpr));
-  const pixelHeight = Math.max(1, Math.round(box.height * dpr));
-  if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
-  if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
-
-  const ctx = canvas.getContext('2d', { alpha: false });
-  if (!ctx) return;
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.fillStyle = '#000';
-  ctx.fillRect(0, 0, box.width, box.height);
 
   const source = sourceSize();
   const layout = computeLayout(source.width, source.height, box.width, box.height, state.ratio, state.mode);
   state.layout = layout;
 
-  const bitmap = state.lastBitmap;
-  if (bitmap) {
-    const bitmapWidth = bitmap.width || source.width;
-    const bitmapHeight = bitmap.height || source.height;
-    const sx = layout.uv.x * bitmapWidth;
-    const sy = layout.uv.y * bitmapHeight;
-    const sw = Math.max(1, layout.uv.w * bitmapWidth);
-    const sh = Math.max(1, layout.uv.h * bitmapHeight);
-    if (state.mirror) {
-      ctx.save();
-      ctx.translate(layout.dest.x + layout.dest.w, layout.dest.y);
-      ctx.scale(-1, 1);
-      ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, layout.dest.w, layout.dest.h);
-      ctx.restore();
-    } else {
-      ctx.drawImage(bitmap, sx, sy, sw, sh, layout.dest.x, layout.dest.y, layout.dest.w, layout.dest.h);
-    }
+  if (!state.hasFrame) {
+    setHidden(crop, true);
+  } else {
+    setHidden(crop, false);
+    // 镜像时先把裁剪窗换算到翻转后的坐标，再交给 scaleX(-1) 翻内容。
+    const uv = state.mirror
+      ? { x: 1 - layout.uv.x - layout.uv.w, y: layout.uv.y, w: layout.uv.w, h: layout.uv.h }
+      : layout.uv;
+    const scale = layout.dest.w / Math.max(0.000001, layout.uv.w * source.width);
+    const drawWidth = source.width * scale;
+    const drawHeight = source.height * scale;
+    crop.style.left = Math.round(layout.dest.x) + 'px';
+    crop.style.top = Math.round(layout.dest.y) + 'px';
+    crop.style.width = Math.round(layout.dest.w) + 'px';
+    crop.style.height = Math.round(layout.dest.h) + 'px';
+    // 两张 <img> 都要摆好，背面那张解码完翻上来时位置才是对的。
+    [dom.viewImg, dom.viewImgB].forEach(function (image) {
+      if (!image) return;
+      image.style.width = drawWidth.toFixed(1) + 'px';
+      image.style.height = drawHeight.toFixed(1) + 'px';
+      image.style.left = Math.round(-uv.x * drawWidth) + 'px';
+      image.style.top = Math.round(-uv.y * drawHeight) + 'px';
+      image.style.transform = state.mirror ? 'scaleX(-1)' : 'none';
+      image.style.zIndex = image === front ? '2' : '1';
+    });
   }
 
-  layoutOverlays(layout, box.width, box.height, !!bitmap);
+  layoutOverlays(layout, box.width, box.height, state.hasFrame);
 }
 
 const overlayCache = { key: '' };
@@ -278,19 +281,24 @@ function layoutOverlays(layout, width, height, hasFrame) {
   }
 }
 
-function closeBitmap() {
-  const bitmap = state.lastBitmap;
-  state.lastBitmap = null;
-  if (bitmap && typeof bitmap.close === 'function') {
-    try { bitmap.close(); } catch (err) { /* 已释放 */ }
-  }
+function clearFrame() {
+  state.hasFrame = false;
+  state.frameFront = 'a';
+  const urls = state.frameUrls;
+  state.frameUrls = [];
+  urls.forEach(function (url) {
+    setTimeout(function () { URL.revokeObjectURL(url); }, 2000);
+  });
+  [dom.viewImg, dom.viewImgB].forEach(function (image) {
+    if (image) image.removeAttribute('src');
+  });
 }
 
 function resetFrameState() {
   state.resets += 1;
   state.pendingFrame = null;
   state.decodeFailures = 0;
-  closeBitmap();
+  clearFrame();
   state.frame = { width: 0, height: 0, fps: 0 };
   updateHud();
   paint();
@@ -357,7 +365,7 @@ function connectStream() {
     } catch (err) {
       if (controller.signal.aborted) return;
       if (err && err.name === 'AbortError') return;
-      if (!state.lastBitmap) {
+      if (!state.hasFrame) {
         // 还没出过画面：多半是设备刚连上、帧还没到，安静重试，别报「流断开」。
         state.streamFailures = 0;
         next = 200;
@@ -395,27 +403,32 @@ function pumpFrames() {
       while (state.pendingFrame) {
         const bytes = state.pendingFrame;
         state.pendingFrame = null;
-        const bitmap = await decodeFrame(bytes);
+        const blob = new Blob([bytes], { type: 'image/jpeg' });
+        const bitmap = await decodeBitmap(blob);
         if (!bitmap) {
           state.decodeFailures += 1;
           continue;
         }
         const lum = frameBrightness(bitmap);
+        const drop = function () {
+          if (typeof bitmap.close === 'function') {
+            try { bitmap.close(); } catch (err) { /* 已释放 */ }
+          }
+        };
         if (lum >= 0 && lum < DARK_LEVEL) {
           // 偶发的全黑帧（手机端抓到空 canvas / 解码出错）直接丢掉：宁可少一帧，
           // 也不要在画面上闪一下黑。
           state.darkFrames += 1;
-          if (typeof bitmap.close === 'function') bitmap.close();
+          drop();
           updateHud();
           continue;
         }
         state.lum = lum;
         state.decodeFailures = 0;
         state.streamFailures = 0;
-        closeBitmap();
-        state.lastBitmap = bitmap;
+        drop();
+        await showFrame(blob);
         if (state.status === 'connecting') setStatus('live');
-        paint();
         if (dom.stageEmpty) setHidden(dom.stageEmpty, true);
       }
     } finally {
@@ -449,37 +462,57 @@ function frameBrightness(bitmap) {
   }
 }
 
-/** 每秒从真正上屏的 canvas 回读一次亮度：内容正常但上屏发黑 = 渲染/合成层出问题。 */
-function samplePainted() {
-  const canvas = dom.view;
-  if (!canvas || !state.lastBitmap || !canvas.width) {
-    state.paintedLum = -1;
-    return;
-  }
-  try {
-    if (!samplePainted.probe) {
-      const probeCanvas = document.createElement('canvas');
-      probeCanvas.width = 16;
-      probeCanvas.height = 9;
-      samplePainted.probe = { canvas: probeCanvas, ctx: probeCanvas.getContext('2d', { willReadFrequently: true }) };
+/** 把一帧 JPEG 交给 <img> 直接合成：用 canvas 逐帧画大图在 WebView2 上偶尔会整块发黑，
+ *  <img> 解码失败时浏览器会保留上一帧，画面只会停帧、不会闪黑。 */
+/** 等这张 <img> 真正解码好（onload 为主，decode() 只做加速，另加超时兜底）。 */
+function waitImageReady(image) {
+  return new Promise(function (resolve) {
+    let settled = false;
+    function finish(ok) {
+      if (settled) return;
+      settled = true;
+      image.onload = null;
+      image.onerror = null;
+      resolve(ok);
     }
-    const probe = samplePainted.probe;
-    if (!probe.ctx) return;
-    probe.ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, 16, 9);
-    const px = probe.ctx.getImageData(0, 0, 16, 9).data;
-    let sum = 0;
-    for (let i = 0; i < px.length; i += 4) sum += (px[i] + px[i + 1] + px[i + 2]) / 3;
-    const mean = sum / (px.length / 4);
-    if (mean < DARK_LEVEL && state.lum >= DARK_LEVEL) state.renderBlack += 1;
-    state.paintedLum = mean;
-  } catch (err) {
-    state.paintedLum = -1;
-  }
-  updateHud();
+    image.onload = function () { finish(true); };
+    image.onerror = function () { finish(false); };
+    if (image.complete) {
+      finish(image.naturalWidth > 0);
+      return;
+    }
+    if (typeof image.decode === 'function') {
+      // decode() 不落地时靠 onload/onerror 与超时兜底，不会把画面卡住。
+      image.decode().then(function () { finish(true); }, function () {});
+    }
+    setTimeout(function () { finish(image.naturalWidth > 0); }, 500);
+  });
 }
 
-async function decodeFrame(bytes) {
-  const blob = new Blob([bytes], { type: 'image/jpeg' });
+async function showFrame(blob) {
+  // 双缓冲：新帧先解码到背面那张 <img>，解码好再翻到前面。
+  // 单张 <img> 每帧换 src 会在解码间隙短暂空掉，Windows 上就是一闪一闪的黑。
+  const back = state.frameFront === 'a' ? dom.viewImgB : dom.viewImg;
+  if (!back) return;
+  const url = URL.createObjectURL(blob);
+  back.src = url;
+  const ready = await waitImageReady(back);
+  if (!ready) {
+    // 解码失败：留着上一帧继续显示，别把画面清空
+    setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+    return;
+  }
+  state.frameUrls.push(url);
+  while (state.frameUrls.length > 3) {
+    const stale = state.frameUrls.shift();
+    setTimeout(function () { URL.revokeObjectURL(stale); }, 1000);
+  }
+  state.frameFront = state.frameFront === 'a' ? 'b' : 'a';
+  state.hasFrame = true;
+  paint();
+}
+
+async function decodeBitmap(blob) {
   if (typeof window.createImageBitmap === 'function') {
     try {
       return await window.createImageBitmap(blob);
@@ -687,7 +720,7 @@ function flash() {
 async function takePhoto() {
   if (state.busy.photo) return;
   if (state.status !== 'live') {
-    toast(state.lastBitmap ? '画面还没有就绪，请稍后再试' : '没有可拍摄的画面', 'error');
+    toast(state.hasFrame ? '画面还没有就绪，请稍后再试' : '没有可拍摄的画面', 'error');
     return;
   }
   state.busy.photo = true;
@@ -713,7 +746,7 @@ async function takePhoto() {
 async function startRecording() {
   if (state.recording || state.busy.record) return;
   if (state.status !== 'live') {
-    toast(state.lastBitmap ? '画面还没有就绪，请稍后再试' : '没有可录制的画面', 'error');
+    toast(state.hasFrame ? '画面还没有就绪，请稍后再试' : '没有可录制的画面', 'error');
     return;
   }
   state.busy.record = true;
@@ -1453,6 +1486,9 @@ function cacheDom() {
   dom.hudRes = $('hud-res');
   dom.hudFps = $('hud-fps');
   dom.hudDiag = $('hud-diag');
+  dom.viewCrop = $('view-crop');
+  dom.viewImg = $('view-img');
+  dom.viewImgB = $('view-img-b');
   dom.stageGrid = $('stage-grid');
   dom.filmList = $('film-list');
   dom.filmEmpty = $('film-empty');
@@ -1712,10 +1748,11 @@ function startTimers() {
     refreshDevices({ silent: true });
   }, 10000);
 
-  state.timers.diag = setInterval(function () {
-    if (document.hidden || !state.lastBitmap) return;
-    samplePainted();
+  state.timers.hud = setInterval(function () {
+    if (document.hidden) return;
+    updateHud();
   }, 1000);
+
 }
 
 async function loadAppInfo() {

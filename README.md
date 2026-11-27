@@ -120,7 +120,9 @@ docs/ui-spec.md    界面与交互规范
 
 手机无线画面防闪黑：手机页把每帧缩到 16×9 估平均亮度，抓到的全黑帧（安卓上偶发的空 canvas）直接丢掉并计入页面上的「跳过」；桌面端收到帧后同样再挡一次（16×9 缩略图平均亮度低于 4 就不上屏，`ui/app.js` 的 `frameBrightness`）。手机页的发送循环是串行的：抓完一帧发出去再抓下一帧，避免多帧并发让旧帧后到，画面忽明忽暗。
 
-取景画面左下角 HUD 末尾会显示三个诊断数字（闪黑排查用）：「亮度」= 最近一帧源画面的平均亮度；「上屏」= 每秒从真正上屏的 canvas 回读一次的亮度；「丢黑」= 被丢掉的黑帧数；「渲染黑」= 源画面正常但上屏后回读为黑的次数。亮度稳定、上屏发黑 → 渲染/合成层问题；亮度自己跳 → 手机相机（曝光）或传输丢帧。
+桌面端显示画面用两张 `<img>` 双缓冲（`ui/index.html` 的 `#view-img` / `#view-img-b`，`ui/app.js` 的 `showFrame`）：新帧先解码到背面那张，`decode()` 完成才翻到前面，任何一次解码都不会让画面空一帧。不要改回单张 `<img>` 每帧换 `src`（解码间隙会短暂空白，实测 14 次截图里 13 次全黑），也不要改回 canvas 逐帧 `drawImage`（Windows WebView2 上偶尔整块发黑）。
+
+取景画面左下角 HUD 末尾显示诊断数字（闪黑排查用）：「亮度」= 最近一帧源画面的平均亮度；「丢黑」= 被丢掉的黑帧数；「重置」= 取景状态被重置的次数（正常启动 + 选源各 1 次，超过 3 次说明在反复重连）。亮度自己跳 → 手机相机曝光或传输丢帧；亮度稳定但画面仍闪 → 渲染/合成层。
 
 ## Windows 打包
 
@@ -128,7 +130,7 @@ Windows 安装包（NSIS `.exe` + MSI）必须在 Windows 上构建：Tauri 打�
 
 三种做法，任选其一：
 
-1. **GitHub Actions**（最省事）：推到 GitHub 后手动触发 `build-windows`（见 `.github/workflows/windows.yml`），产物在 Actions 的 `monitor-windows` 工件里（`MONITOR_1.0.0_x64-setup.exe`、`.msi`，以及免安装的 `monitor-desktop.exe`）。
+1. **GitHub Actions**（最省事）：推到 GitHub 后手动触发 `build-windows`（见 `.github/workflows/windows.yml`），产物在 Actions 的 `monitor-windows` 工件里（`MONITOR_<版本>_x64-setup.exe`、`.msi`，以及免安装的 `monitor-desktop.exe`）。
 2. **Windows 机器本地构建**：装 Rust（MSVC 工具链）、Node 20+、pnpm，然后：
 
    ```powershell

@@ -746,9 +746,27 @@ kbd {
 
 .view {
   display: block;
+  position: relative;
   width: 100%;
   height: 100%;
+  overflow: hidden;
   background: #000;
+}
+
+/* 画面用 <img> 而不是 canvas：WebView2 上 canvas 每帧画大图会偶发整块发黑，
+   <img> 解码失败时浏览器保留上一帧，只会停帧不会闪黑。 */
+.view-crop {
+  position: absolute;
+  overflow: hidden;
+}
+
+.view-img {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 50% 50%;
+  -webkit-user-drag: none;
+  user-select: none;
 }
 
 .stage-grid {
