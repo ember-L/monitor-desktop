@@ -1,6 +1,6 @@
 [package]
 name = "monitor-desktop"
-version = "1.0.1"
+version = "1.0.2"
 edition = "2021"
 description = "MONITOR · Tauri 桌面取景器：本机摄像头 / iPhone USB / Android 屏幕 / 手机无线（扫码），自由调整屏幕比例"
 license = "MIT"

@@ -52,12 +52,17 @@ const state = {
   streamFailures: 0,
   decodeFailures: 0,
   darkFrames: 0,
+  lum: -1,
+  paintedLum: -1,
+  renderBlack: 0,
+  resets: 0,
+  liveEvents: 0,
   deleteArmed: '',
   immersive: false,
   zoomAt: 0,
   busy: { devices: false, photo: false, record: false, pair: false, viewer: false },
   wireless: { open: false, connected: false, url: '', info: null },
-  timers: { clock: 0, rec: 0, refresh: 0, ratio: 0, deleteArm: 0, wirelessHint: 0, frameWatch: 0, wirelessDiag: 0, zoomSync: 0 },
+  timers: { clock: 0, rec: 0, refresh: 0, ratio: 0, deleteArm: 0, wirelessHint: 0, frameWatch: 0, wirelessDiag: 0, zoomSync: 0, diag: 0 },
 };
 
 /* ------------------------------------------------------------------ */
@@ -161,6 +166,14 @@ function updateHud() {
   setText(dom.hudClock, formatClock(new Date()));
   setText(dom.hudRes, formatResolution(state.frame.width, state.frame.height));
   setText(dom.hudFps, formatFps(state.frame.fps));
+  if (dom.hudDiag) {
+    const parts = ['亮度 ' + (state.lum >= 0 ? Math.round(state.lum) : '—')];
+    if (state.paintedLum >= 0) parts.push('上屏 ' + Math.round(state.paintedLum));
+    if (state.darkFrames) parts.push('丢黑 ' + state.darkFrames);
+    if (state.renderBlack) parts.push('渲染黑 ' + state.renderBlack);
+    if (state.resets > 3) parts.push('重置 ' + state.resets);
+    setText(dom.hudDiag, parts.join(' · '));
+  }
   if (dom.deviceName) {
     setText(dom.deviceName, state.source ? state.source.label : '未选择设备');
   }
@@ -206,7 +219,7 @@ function paint() {
   if (canvas.width !== pixelWidth) canvas.width = pixelWidth;
   if (canvas.height !== pixelHeight) canvas.height = pixelHeight;
 
-  const ctx = canvas.getContext('2d');
+  const ctx = canvas.getContext('2d', { alpha: false });
   if (!ctx) return;
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   ctx.fillStyle = '#000';
@@ -238,7 +251,14 @@ function paint() {
   layoutOverlays(layout, box.width, box.height, !!bitmap);
 }
 
+const overlayCache = { key: '' };
+
 function layoutOverlays(layout, width, height, hasFrame) {
+  // 布局没变就别再写样式：每帧改一次绝对定位会让 Windows 的合成层反复重建，
+  // 也是闪黑的诱因之一。
+  const key = [layout.dest.x, layout.dest.y, layout.dest.w, layout.dest.h, width, height, hasFrame ? 1 : 0, state.grid ? 1 : 0].join(',');
+  if (overlayCache.key === key) return;
+  overlayCache.key = key;
   if (dom.hud) {
     dom.hud.style.left = Math.round(layout.dest.x + 10) + 'px';
     dom.hud.style.top = Math.round(layout.dest.y + 10) + 'px';
@@ -267,6 +287,7 @@ function closeBitmap() {
 }
 
 function resetFrameState() {
+  state.resets += 1;
   state.pendingFrame = null;
   state.decodeFailures = 0;
   closeBitmap();
@@ -379,13 +400,16 @@ function pumpFrames() {
           state.decodeFailures += 1;
           continue;
         }
-        if (isBlackFrame(bitmap)) {
+        const lum = frameBrightness(bitmap);
+        if (lum >= 0 && lum < DARK_LEVEL) {
           // 偶发的全黑帧（手机端抓到空 canvas / 解码出错）直接丢掉：宁可少一帧，
           // 也不要在画面上闪一下黑。
           state.darkFrames += 1;
           if (typeof bitmap.close === 'function') bitmap.close();
+          updateHud();
           continue;
         }
+        state.lum = lum;
         state.decodeFailures = 0;
         state.streamFailures = 0;
         closeBitmap();
@@ -400,10 +424,11 @@ function pumpFrames() {
   })();
 }
 
-/** 用 16×9 缩略图估平均亮度，挡住整块黑帧造成的闪黑。 */
+/** 用 16×9 缩略图估平均亮度（0–255，失败返回 -1），挡住整块黑帧造成的闪黑。 */
+const DARK_LEVEL = 4;
 const darkProbe = { canvas: null, ctx: null };
-function isBlackFrame(bitmap) {
-  if (!bitmap) return true;
+function frameBrightness(bitmap) {
+  if (!bitmap) return -1;
   try {
     if (!darkProbe.canvas) {
       darkProbe.canvas = document.createElement('canvas');
@@ -411,17 +436,46 @@ function isBlackFrame(bitmap) {
       darkProbe.canvas.height = 9;
       darkProbe.ctx = darkProbe.canvas.getContext('2d', { willReadFrequently: true });
     }
-    if (!darkProbe.ctx) return false;
+    if (!darkProbe.ctx) return -1;
     darkProbe.ctx.drawImage(bitmap, 0, 0, 16, 9);
     const px = darkProbe.ctx.getImageData(0, 0, 16, 9).data;
     let sum = 0;
     const n = px.length / 4;
-    if (!n) return false;
+    if (!n) return -1;
     for (let i = 0; i < px.length; i += 4) sum += (px[i] + px[i + 1] + px[i + 2]) / 3;
-    return sum / n < 4;
+    return sum / n;
   } catch (err) {
-    return false;
+    return -1;
   }
+}
+
+/** 每秒从真正上屏的 canvas 回读一次亮度：内容正常但上屏发黑 = 渲染/合成层出问题。 */
+function samplePainted() {
+  const canvas = dom.view;
+  if (!canvas || !state.lastBitmap || !canvas.width) {
+    state.paintedLum = -1;
+    return;
+  }
+  try {
+    if (!samplePainted.probe) {
+      const probeCanvas = document.createElement('canvas');
+      probeCanvas.width = 16;
+      probeCanvas.height = 9;
+      samplePainted.probe = { canvas: probeCanvas, ctx: probeCanvas.getContext('2d', { willReadFrequently: true }) };
+    }
+    const probe = samplePainted.probe;
+    if (!probe.ctx) return;
+    probe.ctx.drawImage(canvas, 0, 0, canvas.width, canvas.height, 0, 0, 16, 9);
+    const px = probe.ctx.getImageData(0, 0, 16, 9).data;
+    let sum = 0;
+    for (let i = 0; i < px.length; i += 4) sum += (px[i] + px[i + 1] + px[i + 2]) / 3;
+    const mean = sum / (px.length / 4);
+    if (mean < DARK_LEVEL && state.lum >= DARK_LEVEL) state.renderBlack += 1;
+    state.paintedLum = mean;
+  } catch (err) {
+    state.paintedLum = -1;
+  }
+  updateHud();
 }
 
 async function decodeFrame(bytes) {
@@ -1267,6 +1321,7 @@ function onSourceState(payload) {
     return;
   }
   if (next === 'live') {
+    state.liveEvents += 1;
     clearWirelessHint();
     armFrameWatch();
     if (!state.source) return;
@@ -1348,7 +1403,7 @@ function cacheDom() {
     'btn-refresh', 'device-list', 'device-hint', 'ratio-value', 'ratio-select', 'custom-ratio',
     'ratio-w', 'ratio-h', 'ratio-error', 'mode-group', 'mode-hint', 'btn-grid', 'btn-mirror',
     'btn-photo', 'btn-record', 'btn-record-label', 'btn-open-captures', 'stage', 'view',
-    'stage-grid', 'hud', 'hud-clock', 'hud-res', 'hud-fps', 'rec-badge', 'rec-badge-time',
+    'stage-grid', 'hud', 'hud-clock', 'hud-res', 'hud-fps', 'hud-diag', 'rec-badge', 'rec-badge-time',
     'stage-empty', 'stage-empty-title', 'stage-empty-detail', 'flash', 'film-list', 'film-count',
     'film-empty', 'toasts', 'wireless-modal', 'wireless-qr', 'wireless-url', 'btn-copy-url',
     'wireless-status', 'wireless-hint', 'btn-wireless-close', 'wireless-ip', 'wireless-ip-current',
@@ -1397,6 +1452,7 @@ function cacheDom() {
   dom.hudClock = $('hud-clock');
   dom.hudRes = $('hud-res');
   dom.hudFps = $('hud-fps');
+  dom.hudDiag = $('hud-diag');
   dom.stageGrid = $('stage-grid');
   dom.filmList = $('film-list');
   dom.filmEmpty = $('film-empty');
@@ -1655,6 +1711,11 @@ function startTimers() {
     if (document.hidden) return;
     refreshDevices({ silent: true });
   }, 10000);
+
+  state.timers.diag = setInterval(function () {
+    if (document.hidden || !state.lastBitmap) return;
+    samplePainted();
+  }, 1000);
 }
 
 async function loadAppInfo() {
