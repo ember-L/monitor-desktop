@@ -86,70 +86,53 @@ const DARK_LEVEL = 4;   // 平均亮度低于此值视作黑帧（真正的暗�
 const token = new URLSearchParams(location.search).get("t") || "";
 const ua = navigator.userAgent;
 const platform = /iPhone|iPad|iPod/.test(ua) ? "iPhone" : /Android/.test(ua) ? "Android 手机" : "手机";
-let ws = null, stream = null, sending = false, timer = null, wakeLock = null;
-let sent = 0, skipped = 0, devices = [], camIndex = 0, reconnectDelay = 1000;
-// transport: "ws" = WSS 推流（首选）；"post" = 同源 HTTPS 逐帧上行（WSS 被证书/网络拦下时兜底）
-let transport = "ws", wsFails = 0, postFails = 0, switches = 0, posting = false;
-let autoStart = true;  // 用户手动「暂停发送」后不再自动开始
-// 发送循环代号：每次重建循环加一，旧循环（可能卡在 await fetch 里）在下一个边界自行退出。
-let loopGen = 0, lastSent = Date.now(), hiddenAt = 0;
+let ws = null, stream = null, sending = false, wakeLock = null;
+let sent = 0, skipped = 0, devices = [], camIndex = 0;
+let transport = "ws", wsReady = false, wsFails = 0, postFails = 0, retryTimer, postAbort;
+let probeDelay = 20000, probeAt = Infinity, probeOnNextPost = true;
+let autoStart = true, pairingExpired = false, starting = false, pageSuspended = false;
+// 限制同一时间只有一条上行；旧循环的异步结果不得进入新连接。
+let loopGen = 0;
 // 实时性控制
 // 画质自适应：Wi-Fi 好时 0.8，弱网时降到 0.42 换帧率。JPEG 字节数直接决定空中时间。
-let quality = 0.8, lastAdapt = 0, qWarned = false;
-// 在途帧（已发未回执）：只压 2-3 帧在路上，弱网下主动丢帧而不是排队。
-let sentFrames = 0, ackedFrames = 0, lastAckAt = Date.now(), pendingSends = [], rttEwma = 0;
+let quality = 0.8, lastAdapt = -Infinity, qWarned = false;
+const MAX_IN_FLIGHT = 3, NETWORK_TIMEOUT = 4000;
+let sentFrames = 0, ackedFrames = 0, pendingSends = [], rttEwma = 0;
 
 function badgeSet(text, cls) { badge.textContent = text; badge.className = cls || ""; $("st").textContent = text; }
 function errShow(msg) { const e = $("err"); e.innerHTML = msg || ""; e.style.display = msg ? "block" : "none"; }
 function note(msg) { const n = $("note"); if (n) n.textContent = msg || ""; }
-function fps() { return Math.max(1, parseInt($("fps").value, 10) || 24); }
+function frameInterval() { return 1000 / (Number($("fps").value) || 24); }
 function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
 
-// 在途帧的时间窗：超过这么久还没回执的帧就当丢了（未必是丢了，也可能只是慢，
-// 但对实时传输来说 0.7 秒的帧本来也没用）。不这么算，一次丢包会让「在途」
-// 永久虚高，发送循环就一直以为自己被卡住。
-const PENDING_WINDOW = 700;
-
-function prunePending() {
-  const cut = Date.now() - PENDING_WINDOW;
-  while (pendingSends.length && pendingSends[0] < cut) pendingSends.shift();
-}
-function inFlight() { prunePending(); return pendingSends.length; }
-
-/** 回执到达：更新统计，并用「发出→回执」的时间估一帧的往返延迟。 */
 function onAck(n) {
-  if (typeof n !== "number" || !isFinite(n)) return;
-  if (n > ackedFrames) ackedFrames = n;
-  lastAckAt = Date.now();
-  const sentAt = pendingSends.shift();
-  // 只采信没超窗的样本：否则一次丢包会把 RTT 抬到 700ms 以上，画质被白白压低。
-  if (!sentAt || Date.now() - sentAt > PENDING_WINDOW) return;
-  const rtt = Date.now() - sentAt;
+  if (!Number.isSafeInteger(n) || n <= ackedFrames || n > sentFrames) return;
+  ackedFrames = n;
+  const sentAt = pendingSends.find(p => p.n === n)?.at;
+  while (pendingSends.length && pendingSends[0].n <= n) pendingSends.shift();
+  if (sentAt === undefined) return;
+  const rtt = performance.now() - sentAt;
   rttEwma = rttEwma ? rttEwma * 0.8 + rtt * 0.2 : rtt;
-  adaptQuality(rttEwma, 260, 110);
+  if (wsFails || badge.textContent !== "已连接") badgeSet("已连接", "ok");
+  wsFails = 0;
+  probeDelay = 20000;
+  adaptQuality(rttEwma, 2);
 }
 
-/**
- * 按实测延迟调 JPEG 画质。
- * 无线链路的瓶颈几乎总是「每帧字节数 × 帧率」：降画质比降帧率划算，
- * 画面还是流畅的，只是细节少一点，而排队造成的「慢半拍」会立刻消失。
- */
-function adaptQuality(rtt, hi, lo) {
-  const now = Date.now();
-  if (now - lastAdapt < 700) return;
+function adaptQuality(rtt, periods) {
+  const now = performance.now();
+  const budget = frameInterval() * periods;
   let q = quality;
-  if (rtt > hi) q -= 0.08;
-  else if (rtt < lo) q += 0.04;
-  q = Math.max(0.42, Math.min(0.8, q));
-  if (Math.abs(q - quality) < 0.01) return;
-  quality = Math.round(q * 100) / 100;
+  if (rtt > budget && now - lastAdapt >= 400) q -= 0.08;
+  else if (rtt < budget * 0.6 && now - lastAdapt >= 1800) q += 0.04;
+  q = Math.round(Math.max(0.42, Math.min(0.8, q)) * 100) / 100;
+  if (q === quality) return;
+  quality = q;
   lastAdapt = now;
-  const qEl = $("q");
-  if (qEl) qEl.textContent = quality.toFixed(2);
-  // 只在跨过明显阈值时提示一次，避免刷屏
+  $("q").textContent = quality.toFixed(2);
   if (quality <= 0.62 && !qWarned) {
     qWarned = true;
-    note("Wi-Fi 偏弱：已自动降低画质以保持画面流畅");
+    note("上行偏慢：已降低 JPEG 画质以保持流畅");
   } else if (quality >= 0.78 && qWarned) {
     qWarned = false;
     note("");
@@ -220,228 +203,265 @@ function isBlack() {
 
 async function grab() {
   if (!(video.readyState >= 2 && video.videoWidth > 0)) return null;
-  const w = video.videoWidth, h = video.videoHeight;
+  if (isBlack()) { skipped++; $("sk").textContent = skipped; return null; }
+  // ideal 只是采集建议，部分手机会返回更大的画面。编码尺寸以所选档位为上限。
+  const scale = Math.min(1, (Number($("res").value) || 960) / Math.max(video.videoWidth, video.videoHeight));
+  const w = Math.max(1, Math.round(video.videoWidth * scale));
+  const h = Math.max(1, Math.round(video.videoHeight * scale));
   if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; $("dim").textContent = w + "×" + h; }
   ctx2d.save();
   if ($("mirror").checked) { ctx2d.translate(w, 0); ctx2d.scale(-1, 1); }
   ctx2d.drawImage(video, 0, 0, w, h);
   ctx2d.restore();
-  if (isBlack()) { skipped++; $("sk").textContent = skipped; return null; }
   return new Promise(res => canvas.toBlob(res, "image/jpeg", quality));
 }
 
-/** 首选：每帧一个二进制 WebSocket 消息。串行抓帧再发送，避免多帧并发导致旧帧后到。 */
-function startLoop() {
-  stopLoop();
+function closeSocket() {
+  clearTimeout(retryTimer);
+  wsReady = false;
+  const old = ws;
+  ws = null;
+  if (old) old.close();
+}
+
+function stopTransport() {
   loopGen++;
-  if (transport === "post") { startPost(); return; }
-  const gen = loopGen;
-  (async function tick() {
-    while (gen === loopGen && sending && transport === "ws") {
-      const t0 = Date.now();
-      if (!ws || ws.readyState !== 1) { await sleep(120); continue; }
-      // 只允许 2 帧在途：TCP 缓冲空着不代表对面已经收下，等回执才准。
-      // 回执 1.5 秒没来（旧版电脑端不回执）就不再等，免得画面僵住。
-      if (inFlight() > 2 && Date.now() - lastAckAt < 1200) { await sleep(4); continue; }
-      // 兜底：TLS/内核发送缓冲堆积太多时，先别抓新帧（抓帧是最贵的一步）。
-      if (ws.bufferedAmount > 524288) { await sleep(20); continue; }
-      const blob = await grab();
-      if (gen !== loopGen || !sending) return;
-      if (blob && ws && ws.readyState === 1) {
-        pendingSends.push(Date.now());
-        if (pendingSends.length > 32) pendingSends.shift();
-        sentFrames++;
-        ws.send(blob); sent++; lastSent = Date.now();
+  closeSocket();
+  postAbort?.abort();
+  postAbort = null;
+}
+
+function rejectPairing() {
+  pairingExpired = true;
+  pauseSending();
+  $("toggle").disabled = true;
+  badgeSet("配对失效", "err");
+  errShow("配对码无效：请重新扫描电脑上的二维码。");
+}
+
+function startLoop() {
+  const gen = ++loopGen;
+  const sock = transport === "ws" ? ws : null;
+  const current = () => gen === loopGen && sending;
+  (async () => {
+    while (current()) {
+      // 探测期间仍用 POST；握手成功后，等在途 POST 结束才切换发送通道。
+      if (!sock && wsReady) {
+        transport = "ws";
+        startLoop();
+        return;
       }
-      const wait = 1000 / fps() - (Date.now() - t0);
-      if (wait > 0) await sleep(wait);
+      const t0 = performance.now();
+      // 不排队编码新帧；把 Wi-Fi 的容量用在尽可能新的画面上。
+      if (sock && (pendingSends.length >= MAX_IN_FLIGHT || sock.bufferedAmount > 524288)) {
+        await sleep(8);
+        continue;
+      }
+      const blob = await grab();
+      if (!current()) return;
+      if (blob) {
+        if (sock) {
+          try { sock.send(blob); } catch (e) { failSocket(sock); return; }
+          pendingSends.push({ n: ++sentFrames, at: performance.now() });
+          if (pendingSends.length === 1) armAckDeadline(sock);
+        } else {
+          await uploadFrame(blob, current);
+        }
+      }
+      const wait = frameInterval() - (performance.now() - t0);
+      if (current() && wait > 0) await sleep(wait);
     }
   })();
 }
 
-/** 重建发送循环：旧循环可能因为 iOS 把页面冻结而永远卡在 await 里。 */
-function restartLoop() {
-  loopGen++;
-  posting = false;
-  stopLoop();
-  if (sending) startLoop();
-}
-
-/** 兜底：逐帧 POST，等响应再发下一帧（TLS 连接复用，不会堆积）。 */
-async function startPost() {
-  if (posting) return;
-  posting = true;
-  const gen = loopGen;
-  while (sending && transport === "post" && gen === loopGen) {
-    const t0 = Date.now();
-    const blob = await grab();
-    if (blob) {
-      try {
-        const url = "/frame?t=" + encodeURIComponent(token) + "&name=" + encodeURIComponent(deviceName());
-        // 单帧超时：网络被系统挂起时 fetch 可能永远不返回，不设上限整个循环会僵死。
-        const ac = new AbortController();
-        // 4 秒足够推完一帧；超时太久会让整个循环僵住，反而是稳定性问题。
-        const to = setTimeout(() => { try { ac.abort(); } catch (e) {} }, 4000);
-        try {
-          const r = await fetch(url, { method: "POST", cache: "no-store", headers: { "Content-Type": "image/jpeg" }, body: blob, signal: ac.signal });
-          if (r.status === 403) { errShow("配对码无效：请重新扫描电脑上的二维码。"); sending = false; setToggle(false); break; }
-          if (!r.ok) throw new Error("电脑返回 " + r.status);
-          sent++; postFails = 0; lastSent = Date.now();
-          // 兜底通道没有回执：用请求往返时间估链路状况，一样自适应画质。
-          adaptQuality(Date.now() - t0, 600, 160);
-          if (badge.textContent !== "已连接") { badgeSet("已连接", "ok"); note(""); }
-        } finally { clearTimeout(to); }
-      } catch (e) {
-        postFails++;
-        badgeSet("重连中…", "err");
-        note("上行中断，正在重试…");
-        if (postFails >= 5) { postFails = 0; transport = "ws"; wsFails = 0; posting = false; connect(); return; }
-        await sleep(400);
-        continue;
-      }
-    }
-    const wait = 1000 / fps() - (Date.now() - t0);
-    if (wait > 0) await sleep(wait);
+function armAckDeadline(sock) {
+  clearTimeout(retryTimer);
+  if (pendingSends.length) {
+    const remaining = NETWORK_TIMEOUT - (performance.now() - pendingSends[0].at);
+    retryTimer = setTimeout(() => failSocket(sock), Math.max(0, remaining));
   }
-  if (gen === loopGen) posting = false;
 }
 
-function stopLoop() { if (timer) { clearTimeout(timer); timer = null; } }
+async function uploadFrame(blob, current) {
+  const ac = new AbortController();
+  postAbort = ac;
+  const timeout = setTimeout(() => ac.abort(), NETWORK_TIMEOUT);
+  const sentAt = performance.now();
+  try {
+    const url = "/frame?t=" + encodeURIComponent(token) + "&name=" + encodeURIComponent(deviceName());
+    const r = await fetch(url, { method: "POST", cache: "no-store", headers: { "Content-Type": "image/jpeg" }, body: blob, signal: ac.signal });
+    if (!current()) return;
+    if (r.status === 403) { rejectPairing(); return; }
+    if (!r.ok) throw new Error("电脑返回 " + r.status);
+    sent++;
+    postFails = 0;
+    if (badge.textContent !== "已连接 · 逐帧") badgeSet("已连接 · 逐帧", "ok");
+    adaptQuality(performance.now() - sentAt, 1);
+    if (probeOnNextPost) {
+      probeOnNextPost = false;
+      probeAt = performance.now() + probeDelay;
+    } else if (!ws && performance.now() >= probeAt) {
+      probeDelay = Math.min(probeDelay * 2, 120000);
+      probeAt = performance.now() + probeDelay;
+      connect();
+    }
+  } catch (e) {
+    if (!current()) return;
+    badgeSet("重连中…", "err");
+    const backoff = Math.min(500 * 2 ** postFails, 8000);
+    if (++postFails >= 5) {
+      postFails = 0;
+      stopTransport();
+      retryTimer = setTimeout(tryWebSocket, backoff);
+    } else {
+      await sleep(backoff);
+    }
+  } finally {
+    clearTimeout(timeout);
+    if (postAbort === ac) postAbort = null;
+  }
+}
 
-/** WSS 连不上时切到逐帧上行：证书被拦的环境里，同源 fetch 往往仍然可用。 */
-function switchToPost(reason) {
-  if (transport === "post") return;
-  if (++switches > 4) { errShow("连不上电脑：请确认手机与电脑在同一 Wi-Fi，然后重新扫码。"); return; }
-  transport = "post";
-  try { if (ws) ws.close(); } catch (e) {}
-  ws = null;
-  errShow("");
-  note(reason || "已改用逐帧上传");
-  if (!sending && autoStart) { startSending(); } else { startLoop(); }
+function tryWebSocket() {
+  if (!sending || document.hidden || pageSuspended) return;
+  stopTransport();
+  transport = "ws";
+  connect();
+}
+
+function failSocket(sock) {
+  if (ws !== sock || !sending) return;
+  if (transport === "post") { closeSocket(); return; }
+  stopTransport();
+  badgeSet("重连中…", "err");
+  if (++wsFails >= 2) {
+    transport = "post";
+    probeOnNextPost = true;
+    badgeSet("改用逐帧上传…");
+    startLoop();
+  } else {
+    retryTimer = setTimeout(connect, 1000);
+  }
 }
 
 function connect() {
-  if (transport === "post") return;
-  badgeSet("连接中…");
-  const sock = new WebSocket("wss://" + location.host + "/ws");
+  if (!sending || document.hidden || pageSuspended || ws) return;
+  if (transport === "ws") badgeSet("连接中…");
+  let sock;
+  try { sock = new WebSocket("wss://" + location.host + "/ws"); }
+  catch (e) { failSocket(null); return; }
   ws = sock;
+  const fail = () => failSocket(sock);
+  const sendInfo = (message) => {
+    try { sock.send(JSON.stringify(message)); } catch (e) { fail(); }
+  };
+  retryTimer = setTimeout(fail, NETWORK_TIMEOUT);
   sock.onopen = () => {
-    if (ws !== sock) return;
-    reconnectDelay = 1000; wsFails = 0;
-    // 回执计数按连接计：新连接从 0 开始，和电脑端的每连接计数对齐。
-    sentFrames = 0; ackedFrames = 0; pendingSends = []; lastAckAt = Date.now(); rttEwma = 0;
-    badgeSet("已连接", "ok");
-    errShow("");
-    sock.send(JSON.stringify({ type: "hello", name: deviceName(), token }));
-    // 打开页面就开始送画面，不再要求用户手动点「开始发送」
-    if (sending) { startLoop(); } else if (autoStart) { startSending(); }
+    if (ws === sock) sendInfo({ type: "hello", name: deviceName(), token });
   };
-  sock.onclose = () => {
-    if (ws !== sock) return;
-    if (transport === "post") return;
-    stopLoop();
-    ws = null;
-    wsFails++;
-    if (wsFails >= 2) { switchToPost("加密 WebSocket 连不上，已改用逐帧上传（画面仍可正常显示）"); return; }
-    badgeSet("重连中…", "err");
-    setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 1.6, 8000);
+  sock.onclose = sock.onerror = fail;
+  sock.onmessage = ({ data }) => {
+    if (ws !== sock || typeof data !== "string") return;
+    let m;
+    try { m = JSON.parse(data); } catch (e) { return; }
+    if (m?.type === "error" && m.message === "配对码无效") { rejectPairing(); return; }
+    if (m?.type === "hello-ok" && !wsReady) {
+      wsReady = true;
+      clearTimeout(retryTimer);
+      sentFrames = 0; ackedFrames = 0; pendingSends = []; rttEwma = 0;
+      if (transport === "ws") startLoop();
+    } else if (m?.type === "ack" && wsReady) {
+      const before = ackedFrames;
+      onAck(m.n);
+      sent += ackedFrames - before;
+      if (ackedFrames !== before) armAckDeadline(sock);
+    }
   };
-  sock.onmessage = (ev) => {
-    if (ws !== sock || typeof ev.data !== "string") return;
-    try {
-      const m = JSON.parse(ev.data);
-      if (m && m.type === "ack") onAck(m.n);
-    } catch (e) {}
-  };
-  sock.onerror = () => { try { sock.close(); } catch (e) {} };
+}
+
+async function keepAwake() {
+  if (wakeLock || !navigator.wakeLock) return;
+  try {
+    const lock = await navigator.wakeLock.request("screen");
+    if (!sending || document.hidden || wakeLock) { await lock.release(); return; }
+    wakeLock = lock;
+    lock.addEventListener("release", () => { if (wakeLock === lock) wakeLock = null; });
+  } catch (e) { /* 某些浏览器不支持屏幕唤醒锁 */ }
 }
 
 async function startSending() {
-  if (sending) return true;
+  if (sending || starting || pairingExpired) return;
+  starting = true;
   try {
     if (!stream) await openCamera();
   } catch (e) {
     errShow(e && e.name === "NotAllowedError" ? "相机权限被拒绝：请在浏览器设置里允许访问相机，然后重新载入本页。"
       : "无法打开相机：" + (e && e.message ? e.message : e));
-    return false;
-  }
+    return;
+  } finally { starting = false; }
+  if (!autoStart) return;
   sending = true;
-  lastSent = Date.now();
+  wsFails = postFails = 0;
+  probeDelay = 20000;
   setToggle(true);
-  if (transport === "ws" && ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "name", name: deviceName() }));
-  startLoop();
-  try { wakeLock = await navigator.wakeLock.request("screen"); } catch (e) {}
-  return true;
+  tryWebSocket();
+  keepAwake();
 }
 
 function pauseSending() {
-  sending = false;
-  autoStart = false;
-  stopLoop();
+  sending = autoStart = false;
+  stopTransport();
   setToggle(false);
+  badgeSet("已暂停");
   if (wakeLock) { wakeLock.release().catch(() => {}); wakeLock = null; }
 }
 
-$("toggle").onclick = async () => {
+$("toggle").onclick = () => {
   if (sending) { pauseSending(); return; }
   autoStart = true;
-  await startSending();
+  startSending();
 };
 $("cam").onchange = async () => {
   camIndex = parseInt($("cam").value, 10) || 0;
-  try { await openCamera(); if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "name", name: deviceName() })); }
-  catch (e) { errShow("切换摄像头失败：" + e.message); }
+  try {
+    await openCamera();
+    if (ws?.readyState === 1) ws.send(JSON.stringify({ type: "name", name: deviceName() }));
+  } catch (e) { errShow("切换摄像头失败：" + e.message); }
 };
 $("res").onchange = async () => { if (stream) { try { await openCamera(); } catch (e) {} } };
 $("mirror").onchange = () => { video.style.transform = $("mirror").checked ? "scaleX(-1)" : ""; };
 setInterval(() => { $("sf").textContent = sent; sent = 0; }, 1000);
-setInterval(() => { if (ws && ws.readyState === 1) ws.send(JSON.stringify({ type: "ping" })); }, 5000);
+function resumeTransport() {
+  if (!sending || document.hidden || pageSuspended) return;
+  // iOS 可能冻结旧请求。恢复时重建上行，不等待旧请求返回。
+  stopTransport();
+  if (transport === "post") startLoop();
+  else connect();
+  keepAwake();
+}
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden) { hiddenAt = Date.now(); return; }
-  if (!sending) return;
-  const away = hiddenAt ? Date.now() - hiddenAt : 0;
-  hiddenAt = 0;
-  // iOS 会把后台页面的 JS 冻结：回到前台后必须重建循环，否则循环可能永远卡在 await 上。
-  lastSent = Date.now();
-  if (transport === "ws" && away > 3000) {
-    // 后台期间这条 socket 多半已经假死（send 不报错但对面收不到），直接换一条。
-    try { if (ws) ws.close(); } catch (e) {}
-    ws = null;
-    connect();
-  }
-  restartLoop();
-  if (!wakeLock && navigator.wakeLock) { navigator.wakeLock.request("screen").then(l => { wakeLock = l; }).catch(() => {}); }
+  if (!sending || pageSuspended) return;
+  if (document.hidden) stopTransport();
+  else resumeTransport();
 });
-// 看门狗：发送中却连续 6 秒没成功送出一帧，就重建循环（覆盖系统冻结、连接假死）。
-setInterval(() => {
-  if (!sending) return;
-  if (Date.now() - lastSent < 6000) return;
-  lastSent = Date.now();
-  badgeSet("重连中…", "err");
-  note("画面停住了，正在自动恢复…");
-  restartLoop();
-}, 3000);
-// 部分 iOS 版本要用户点一下页面才给相机权限：首次触摸补一次自动开始。
 document.addEventListener("pointerdown", (e) => {
-  if (e.target && e.target.closest && e.target.closest("#toggle")) return;
-  if (sending || !autoStart || stream) return;
+  if (e.target?.closest?.("#toggle") || !autoStart) return;
   startSending();
 }, { passive: true });
-
 window.addEventListener("pagehide", () => {
-  try { navigator.sendBeacon("/bye?t=" + encodeURIComponent(token)); } catch (e) {}
+  pageSuspended = true;
+  stopTransport();
+  if (sending) {
+    try { navigator.sendBeacon("/bye?t=" + encodeURIComponent(token)); } catch (e) {}
+  }
+});
+window.addEventListener("pageshow", (e) => {
+  pageSuspended = false;
+  if (e.persisted) resumeTransport();
 });
 
-(async () => {
-  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-    errShow("此浏览器不支持相机访问，请使用 Safari / Chrome。"); return;
-  }
-  try { await openCamera(); } catch (e) {
-    errShow("等待相机权限：允许访问相机后会自动开始发送。");
-  }
-  connect();
-})();
+if (navigator.mediaDevices?.getUserMedia) startSending();
+else errShow("此浏览器不支持相机访问，请使用 Safari / Chrome。");
 </script>
 </body>
 </html>

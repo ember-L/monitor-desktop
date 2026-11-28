@@ -43,6 +43,7 @@ struct App {
 #[serde(rename_all = "camelCase")]
 struct AppInfo {
     stream_url: String,
+    preview_url: String,
     media_base: String,
     version: String,
 }
@@ -146,6 +147,7 @@ fn app_info(app: State<'_, Arc<App>>) -> AppInfo {
     eprintln!("[monitor] app_info 已由界面调用 → {}", app.viewer.base());
     AppInfo {
         stream_url: app.viewer.url("/stream"),
+        preview_url: app.viewer.preview_url(),
         media_base: app.viewer.base(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     }
@@ -532,6 +534,7 @@ fn main() {
                 }
                 // 在真实 WebView 里验证本地取景服务能不能被 fetch 到（CORS / 流式读取）。
                 let stream_url = state.viewer.url("/stream");
+                let preview_url = state.viewer.preview_url();
                 let health_url = state.viewer.url("/health");
                 let frame_url = state.viewer.url("/frame.jpg");
                 let js = r#"(function(){
@@ -539,6 +542,17 @@ fn main() {
     try { window.__TAURI__.core.invoke('probe_report', { tag: tag, ok: ok, detail: String(detail) }); } catch (e) {}
   }
   send('boot', true, location.protocol + '//' + location.host);
+  try {
+    var preview = new WebSocket('@PREVIEW@');
+    var previewTimeout = setTimeout(function(){ send('preview', false, 'timeout'); preview.close(); }, 3500);
+    preview.onopen = function(){ preview.send('next'); };
+    preview.onmessage = function(e){
+      clearTimeout(previewTimeout);
+      send('preview', e.data === 'idle' || e.data instanceof Blob, e.data === 'idle' ? 'idle' : 'JPEG bytes=' + e.data.size);
+      preview.close();
+    };
+    preview.onerror = function(){ clearTimeout(previewTimeout); send('preview', false, 'WebSocket error'); };
+  } catch (e) { send('preview', false, e.message); }
   fetch('@HEALTH@', { cache: 'no-store' })
     .then(function(r){ send('health', r.ok, 'status=' + r.status); })
     .catch(function(e){ send('health', false, e.name + ': ' + e.message); });
@@ -618,6 +632,7 @@ fn main() {
 })();"#
                     .replace("@HEALTH@", &health_url)
                     .replace("@STREAM@", &stream_url)
+                    .replace("@PREVIEW@", &preview_url)
                     .replace("@FRAME@", &frame_url);
                 let win = app.get_webview_window("main");
                 std::thread::spawn(move || {

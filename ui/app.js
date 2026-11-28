@@ -3,7 +3,7 @@
  *
  * 纯静态 ES 模块，无构建步骤：
  *   - 全部后端能力走 window.__TAURI__（withGlobalTauri: true）
- *   - 画面走 fetch + ReadableStream 的 MJPEG 解析（见 mjpeg.js）
+ *   - 画面优先走本地 WebSocket，失败时用 JPEG 长轮询
  *   - 布局/比例换算见 layout.js，格式化见 format.js
  */
 
@@ -15,6 +15,7 @@ import { formatClock, formatSecs, formatFps, formatResolution, formatBytes, shor
 /* ------------------------------------------------------------------ */
 
 const tauri = window.__TAURI__ || null;
+const isWindows = /Windows NT/.test(window.navigator?.userAgent || '');
 
 const dom = {};
 
@@ -46,13 +47,9 @@ const state = {
   frameUrls: [],
   layout: null,
   pendingFrame: null,
-  lastBytes: null,
   decoding: false,
-  streamAbort: null,
+  streamCleanup: null,
   streamToken: 0,
-  reconnectTimer: 0,
-  pollTimer: 0,
-  streamFailures: 0,
   decodeFailures: 0,
   darkFrames: 0,
   darkStreak: 0,
@@ -141,7 +138,7 @@ function applyStatus() {
 
   const busy = state.status === 'connecting';
   if (dom.stage) dom.stage.classList.toggle('is-busy', busy);
-  if (dom.stageEmpty) setHidden(dom.stageEmpty, state.status === 'live' && state.hasFrame);
+  if (dom.stageEmpty) setHidden(dom.stageEmpty, state.hasFrame && (state.status === 'live' || busy));
 
   let title = '还没有画面';
   let detail = '在左侧选择一个设备开始取景。';
@@ -311,8 +308,8 @@ function layoutOverlays(layout, width, height, hasFrame) {
 function clearFrame() {
   state.hasFrame = false;
   state.frameFront = 'a';
-  state.lastBytes = null;
   state.lum = -1;
+  state.darkStreak = 0;
   const urls = state.frameUrls;
   state.frameUrls = [];
   urls.forEach(function (url) {
@@ -334,141 +331,148 @@ function resetFrameState() {
 }
 
 /* ------------------------------------------------------------------ */
-/* MJPEG 客户端                                                        */
+/* 本地预览客户端                                                        */
 /* ------------------------------------------------------------------ */
 
 function stopStream() {
-  if (state.streamAbort) {
-    try { state.streamAbort.abort(); } catch (err) { /* 已断开 */ }
-    state.streamAbort = null;
-  }
   state.streamToken += 1;
-  clearTimeout(state.reconnectTimer);
-  state.reconnectTimer = 0;
-  clearTimeout(state.pollTimer);
-  state.pollTimer = 0;
-}
-
-/**
- * 把本地取景服务的 /stream 换成单帧地址 /frame.jpg。
- * 原因：WKWebView（Tauri 的 WKWebView / macOS）拿不到 multipart 长连接的流式 body，
- * fetch 打开后第一次 read 直接 TypeError: Load failed，桌面端永远收不到画面。
- * 单帧请求-响应在 WebKit 里稳定，代价只是每帧一个本地小请求。
- */
-function snapshotUrl(streamUrl) {
-  return streamUrl.replace(/\/stream(?=$|[?#])/, '/frame.jpg');
+  state.streamCleanup?.();
+  state.streamCleanup = null;
 }
 
 function connectStream() {
-  if (!state.source) return;
-  if (!state.info || !state.info.streamUrl) return;
-  stopStream();
+  if (!state.source || !state.info?.streamUrl || state.streamCleanup) return;
   const token = state.streamToken;
-  const base = snapshotUrl(state.info.streamUrl);
-  let inFlight = false;
-  // 上一次拿到的帧号。带上它请求会挂起到有新帧才返回（长轮询），
-  // 不再固定 30ms 空转：省掉轮询间隔带来的延迟，也少掉大量空请求。
-  let seq = -1;
+  // WKWebView 的 fetch 无法读取 multipart 流，兜底用完整 JPEG 的 HTTP 长轮询。
+  const base = state.info.streamUrl.replace(/\/stream(?=$|[?#])/, '/frame.jpg');
+  const preview = state.info.previewUrl;
+  const active = () => token === state.streamToken;
+  let socket, controller, timer, deadline, failures = 0, seq = -1, probeAt = Infinity;
+  let probeDelay = 20000, usingHttp = false;
 
-  async function tick() {
-    if (token !== state.streamToken || !state.source) return;
-    if (inFlight) {
-      state.pollTimer = setTimeout(tick, 16);
-      return;
+  function closeSocket() {
+    const old = socket;
+    socket = null;
+    clearTimeout(deadline);
+    if (old) old.close();
+  }
+
+  state.streamCleanup = () => {
+    clearTimeout(timer);
+    controller?.abort();
+    closeSocket();
+  };
+
+  function connectSocket() {
+    function fallback() {
+      closeSocket();
+      probeAt = performance.now() + probeDelay;
+      probeDelay = Math.min(probeDelay * 2, 60000);
+      if (usingHttp) return;
+      setStatus('connecting', '预览连接中断，正在通过快照恢复…');
+      usingHttp = true;
+      poll();
     }
-    inFlight = true;
-    const controller = new AbortController();
-    state.streamAbort = controller;
-    let next = 0;
+    let sock;
+    try { sock = new WebSocket(preview); }
+    catch (err) { fallback(); return; }
+    socket = sock;
+    const current = () => active() && sock === socket;
+    const fail = () => { if (current()) fallback(); };
+    const expectResponse = () => { deadline = setTimeout(fail, 3000); };
+    const nextFrame = () => {
+      if (!current()) return;
+      expectResponse();
+      try { sock.send('next'); } catch (err) { fail(); }
+    };
+    sock.onopen = () => {
+      if (!current()) return;
+      clearTimeout(deadline);
+      nextFrame();
+    };
+    sock.onmessage = async ({ data }) => {
+      if (!current()) return;
+      clearTimeout(deadline);
+      if (data !== 'idle' && (!(data instanceof Blob) || !data.size)) { fail(); return; }
+      if (usingHttp) {
+        usingHttp = false;
+        clearTimeout(timer);
+        controller?.abort();
+        controller = null;
+      }
+      if (data !== 'idle') {
+        probeDelay = 20000;
+        await queueFrame(data.slice(0, data.size, 'image/jpeg'));
+      }
+      nextFrame();
+    };
+    sock.onerror = sock.onclose = fail;
+    expectResponse();
+  }
+
+  async function poll() {
+    if (!active() || !usingHttp) return;
+    if (performance.now() >= probeAt && !socket) connectSocket();
+    const request = new AbortController();
+    controller = request;
+    const polling = () => active() && usingHttp && !request.signal.aborted;
+    const timeout = setTimeout(() => request.abort(), 3000);
+    let delay = 0;
     try {
-      let url = base;
-      if (seq >= 0) url += (base.indexOf('?') >= 0 ? '&' : '?') + 'v=' + seq + '&wait=250';
-      const response = await fetch(url, { cache: 'no-store', signal: controller.signal });
-      if (token !== state.streamToken) return;
-      if (response.status === 204) {
-        // 等到超时也没有新帧：立刻续上下一次等待，不做空转
-        next = 0;
-      } else if (response.status === 404) {
-        // 设备已连上但还没有帧：稍等再试
-        next = 120;
-      } else if (!response.ok) {
-        throw new Error('画面服务返回 ' + response.status);
+      const url = seq < 0 ? base : base + (base.includes('?') ? '&' : '?') + 'v=' + seq + '&wait=250';
+      const response = await fetch(url, { cache: 'no-store', signal: request.signal });
+      if (!polling()) return;
+      if (response.status === 204 || response.status === 404) {
+        delay = response.status === 404 ? 120 : 0;
       } else {
-        const header = response.headers.get('x-frame-seq');
-        const got = header === null ? NaN : Number(header);
-        if (Number.isFinite(got)) seq = got;
-        const buffer = await response.arrayBuffer();
-        if (token !== state.streamToken) return;
-        if (buffer.byteLength) queueFrame(new Uint8Array(buffer));
-        // 服务端没给帧号（旧版本）：退回固定间隔轮询，避免反复取同一帧空转。
-        next = Number.isFinite(got) ? 0 : 30;
+        if (!response.ok) throw new Error('画面服务返回 ' + response.status);
+        const blob = await response.blob();
+        if (!polling()) return;
+        seq = Number(response.headers.get('x-frame-seq') ?? -1);
+        delay = seq >= 0 ? 0 : 30;
+        clearTimeout(timeout);
+        await queueFrame(blob);
       }
+      failures = 0;
     } catch (err) {
-      if (controller.signal.aborted) return;
-      if (err && err.name === 'AbortError') return;
-      if (!state.hasFrame) {
-        // 还没出过画面：多半是设备刚连上、帧还没到，安静重试，别报「流断开」。
-        state.streamFailures = 0;
-        next = 200;
-      } else {
-        state.streamFailures += 1;
-        next = 300;
-        if (state.streamFailures === 6) {
-          toast('画面流断开，正在自动重连…', 'error');
-        } else if (state.streamFailures === 30) {
-          toast('本地画面取不到：' + (err && err.message ? err.message : '网络错误'), 'error');
-        }
-      }
+      if (!active() || !usingHttp || controller !== request) return;
+      delay = Math.min(250 * 2 ** failures, 4000);
+      if (delay < 4000) failures++;
+      setStatus('connecting', '本地预览暂时不可用，正在自动重试…');
     } finally {
-      inFlight = false;
-      if (token === state.streamToken) {
-        state.streamAbort = null;
-        if (state.source) state.pollTimer = setTimeout(tick, next);
+      clearTimeout(timeout);
+      if (controller === request) {
+        controller = null;
+        if (active() && usingHttp) timer = setTimeout(poll, delay);
       }
     }
   }
 
-  tick();
+  if (preview && typeof WebSocket === 'function') connectSocket();
+  else { usingHttp = true; poll(); }
 }
 
-function queueFrame(bytes) {
-  if (!bytes || !bytes.length) return;
-  state.pendingFrame = bytes;
-  if (!state.decoding) pumpFrames();
+function queueFrame(blob) {
+  if (!blob.size) return;
+  state.pendingFrame = blob;
+  if (!state.decoding) state.decoding = pumpFrames();
+  return state.decoding;
 }
 
 function pumpFrames() {
-  state.decoding = true;
-  (async function () {
+  return (async function () {
     try {
       while (state.pendingFrame) {
-        const bytes = state.pendingFrame;
+        const blob = state.pendingFrame;
         state.pendingFrame = null;
-        state.lastBytes = bytes;
-        const blob = new Blob([bytes], { type: 'image/jpeg' });
-        // 每帧只解码一次：JPEG 直接交给背面那张 <img>，亮度另走 16×9 缩图的廉价解码。
-        // 早先每帧先全尺寸 createImageBitmap 算亮度、再交给 <img> 解第二遍，
-        // 960/1280 大帧下解码量翻倍 —— 这是「960 闪、640 稳」的一个来源，已去掉。
-        const lum = await frameLum(blob);
-        if (lum >= 0) state.lum = lum;
-        if (lum >= 0 && lum < DARK_LEVEL) {
-          // 手机端偶发整块黑帧：挡掉，画面停在上一帧，而不是闪一下黑。
-          // 但只挡 DARK_HOLD 帧：真的把镜头捂住时，画面要能变黑，不能永久冻住。
-          state.darkFrames += 1;
-          state.darkStreak += 1;
-          if (state.darkStreak <= DARK_HOLD) {
-            updateHud();
-            continue;
-          }
-        }
-        state.darkStreak = 0;
         const result = await showFrame(blob);
+        if (result === 'skipped') continue;
         if (result === 'failed') {
           state.decodeFailures += 1;
           continue;
         }
         state.decodeFailures = 0;
-        state.streamFailures = 0;
+        armFrameWatch();
         if (state.status === 'connecting') setStatus('live');
         if (dom.stageEmpty) setHidden(dom.stageEmpty, true);
       }
@@ -487,7 +491,7 @@ const DARK_HOLD = 8;
 // 采样用的 16×9 离屏 canvas（懒创建）。
 const darkProbe = { canvas: null, ctx: null };
 
-// 廉价亮度采样：只解 16×9 的缩图（JPEG 支持缩尺寸解码，成本是全尺寸的零头）。
+// 亮度只读 16×9 缩图；实际 JPEG 解码成本取决于 WebView 引擎。
 // 不支持的引擎放弃采样，绝不退回每帧全尺寸解码 —— 那会把显示路径拖垮。
 let lumUnsupported = 0;
 
@@ -507,8 +511,7 @@ async function frameLum(blob) {
   }
 }
 
-function frameBrightness(bitmap) {
-  if (!bitmap) return -1;
+function frameBrightness(image) {
   try {
     if (!darkProbe.canvas) {
       darkProbe.canvas = document.createElement('canvas');
@@ -517,11 +520,12 @@ function frameBrightness(bitmap) {
       darkProbe.ctx = darkProbe.canvas.getContext('2d', { willReadFrequently: true });
     }
     if (!darkProbe.ctx) return -1;
-    darkProbe.ctx.drawImage(bitmap, 0, 0, 16, 9);
+    darkProbe.ctx.clearRect(0, 0, 16, 9);
+    darkProbe.ctx.drawImage(image, 0, 0, 16, 9);
     const px = darkProbe.ctx.getImageData(0, 0, 16, 9).data;
     let sum = 0;
     const n = px.length / 4;
-    if (!n) return -1;
+    if (!n || !px[3]) return -1;
     for (let i = 0; i < px.length; i += 4) sum += (px[i] + px[i + 1] + px[i + 2]) / 3;
     return sum / n;
   } catch (err) {
@@ -529,28 +533,27 @@ function frameBrightness(bitmap) {
   }
 }
 
-/** 等这张 <img> 真正解码好（onload 为主，decode() 只做加速，另加超时兜底）。 */
 function waitImageReady(image) {
   return new Promise(function (resolve) {
     let settled = false;
+    const timeout = setTimeout(function () { finish(false); }, 500);
     function finish(ok) {
       if (settled) return;
       settled = true;
+      clearTimeout(timeout);
       image.onload = null;
       image.onerror = null;
       resolve(ok);
     }
-    image.onload = function () { finish(true); };
-    image.onerror = function () { finish(false); };
-    if (image.complete) {
-      finish(image.naturalWidth > 0);
-      return;
-    }
+    // load / naturalWidth 只证明图片资源可用，不保证像素已解码。
     if (typeof image.decode === 'function') {
-      // decode() 不落地时靠 onload/onerror 与超时兜底，不会把画面卡住。
-      image.decode().then(function () { finish(true); }, function () {});
+      image.decode().then(function () { finish(true); }, function () { finish(false); });
+    } else if (image.complete) {
+      finish(image.naturalWidth > 0);
+    } else {
+      image.onload = function () { finish(true); };
+      image.onerror = function () { finish(false); };
     }
-    setTimeout(function () { finish(image.naturalWidth > 0); }, 500);
   });
 }
 
@@ -561,13 +564,29 @@ async function showFrame(blob) {
   // 单张 <img> 每帧换 src 会在解码间隙短暂空掉，Windows 上就是一闪一闪的黑。
   const back = state.frameFront === 'a' ? dom.viewImgB : dom.viewImg;
   if (!back) return 'failed';
+  const token = state.streamToken;
   const url = URL.createObjectURL(blob);
   back.src = url;
-  const ready = await waitImageReady(back);
+  // WebView2 复用已解码的图像；WKWebView 曾从刚解码的 <img> 读到空像素。
+  const [ready, sampled] = await Promise.all([waitImageReady(back), isWindows ? -1 : frameLum(blob)]);
+  if (token !== state.streamToken) {
+    URL.revokeObjectURL(url);
+    return 'skipped';
+  }
   if (!ready) {
-    // 解码失败：留着上一帧继续显示，别把画面清空
-    setTimeout(function () { URL.revokeObjectURL(url); }, 0);
+    URL.revokeObjectURL(url);
     return 'failed';
+  }
+  const lum = isWindows ? frameBrightness(back) : sampled;
+  if (lum >= 0) state.lum = lum;
+  if (lum >= 0 && lum < DARK_LEVEL) {
+    if (++state.darkStreak <= DARK_HOLD) {
+      state.darkFrames += 1;
+      URL.revokeObjectURL(url);
+      return 'skipped';
+    }
+  } else {
+    state.darkStreak = 0;
   }
   state.frameUrls.push(url);
   while (state.frameUrls.length > 3) {
@@ -731,7 +750,6 @@ async function selectSource(kind, id, label) {
   await releaseSource();
   state.source = { kind: kind, id: id, label: label || '设备' };
   state.gen = 0;
-  state.streamFailures = 0;
   setStatus('connecting', '正在启动 ' + (label || '设备') + '…');
   if (kind === 'wireless') armWirelessHint();
   updateHud();
@@ -1401,20 +1419,18 @@ function onSourceState(payload) {
   if (next === 'live') {
     state.liveEvents += 1;
     clearWirelessHint();
-    armFrameWatch();
     if (!state.source) return;
     const changed = gen > 0 && gen !== state.gen;
     if (changed) {
       state.gen = gen;
+      stopStream();
       resetFrameState();
     }
-    setStatus('live');
-    if (changed || !state.streamAbort) connectStream();
+    connectStream();
   }
 }
 
 function onFrameInfo(payload) {
-  armFrameWatch();
   if (!payload) return;
   const gen = Number(payload.gen) || 0;
   if (gen > 0 && state.gen > 0 && gen !== state.gen) return;
@@ -1776,8 +1792,6 @@ function syncImmersiveFromWindow() {
 /* ------------------------------------------------------------------ */
 
 function startTimers() {
-  // 亮度采样：只喂 HUD 诊断，不挡在显示路径上（600ms 一次，小尺寸解码）。
-
   state.timers.clock = setInterval(function () {
     setText(dom.hudClock, formatClock(new Date()));
   }, 500);

@@ -6,7 +6,7 @@ use crate::source::Event;
 use serde::Serialize;
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{RecvTimeoutError, Sender};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
@@ -147,7 +147,8 @@ pub struct Wireless {
     /// 连接与请求计数（诊断用，不含画面内容）。
     diag: Mutex<Diag>,
     info: Mutex<Option<PairInfo>>,
-    connected: Mutex<Option<String>>,
+    connected: Mutex<Option<(u64, String)>>,
+    next_ws_id: AtomicU64,
     stop: Arc<AtomicBool>,
     starting: Mutex<bool>,
 }
@@ -162,6 +163,7 @@ impl Wireless {
             diag: Mutex::new(Diag::default()),
             info: Mutex::new(None),
             connected: Mutex::new(None),
+            next_ws_id: AtomicU64::new(1),
             stop: Arc::new(AtomicBool::new(false)),
             starting: Mutex::new(false),
         })
@@ -353,32 +355,32 @@ impl Wireless {
         }
     }
 
-    /// 逐帧 POST 上行没有握手，第一帧到达即视为手机上线。
-    fn mark_connected(&self, name: Option<&str>) {
-        let name = name.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
-        let changed = match self.connected.lock() {
-            Ok(mut c) => {
-                if c.is_some() && name.is_none() {
-                    false
-                } else {
-                    *c = name.clone();
-                    true
-                }
+    /// 只有收到帧才切换连接归属；复用 POST 或探测 WSS 不应重复弹出通知。
+    fn mark_connected(&self, id: u64, name: Option<&str>) {
+        let name = name.map(str::trim).filter(|s| !s.is_empty());
+        let Ok(mut connected) = self.connected.lock() else { return };
+        if let Some((current, label)) = connected.as_mut() {
+            if name.is_none() || name == Some(label.as_str()) {
+                *current = id;
+                return;
             }
-            Err(_) => false,
-        };
-        if changed {
-            let _ = self.tx.send(Event::Wireless { connected: true, name, hint: None });
         }
+        let name = name.unwrap_or("无线手机").to_string();
+        *connected = Some((id, name.clone()));
+        let _ = self.tx.send(Event::Wireless { connected: true, name: Some(name), hint: None });
     }
 
-    fn mark_disconnected(&self, hint: Option<String>) {
-        let name = self.connected.lock().ok().and_then(|mut c| c.take());
-        let _ = self.tx.send(Event::Wireless { connected: false, name, hint });
+    fn mark_disconnected(&self, id: u64) {
+        let Ok(mut connected) = self.connected.lock() else { return };
+        if connected.as_ref().map(|(current, _)| *current) != Some(id) { return; }
+        let name = connected.take().map(|(_, name)| name);
+        let _ = self.tx.send(Event::Wireless { connected: false, name, hint: Some("手机已断开连接".into()) });
     }
 
-    fn token(&self) -> String {
-        self.info.lock().ok().and_then(|i| i.as_ref().map(|p| p.token.clone())).unwrap_or_default()
+    fn valid_token(&self, token: &str) -> bool {
+        !token.is_empty() && self.info.lock().is_ok_and(|info| {
+            info.as_ref().is_some_and(|pair| pair.available && pair.token == token)
+        })
     }
 }
 
@@ -636,7 +638,7 @@ impl Wireless {
         let guard = self.diag.lock().ok();
         let fallback = Diag::default();
         let d = guard.as_deref().unwrap_or(&fallback);
-        let connected = self.connected.lock().ok().and_then(|c| c.clone());
+        let connected = self.connected.lock().ok().and_then(|c| c.as_ref().map(|(_, name)| name.clone()));
         let buffered = self.latest.lock().map(|l| l.is_some()).unwrap_or(false);
         serde_json::json!({
             "connected": connected.is_some(),
@@ -707,7 +709,7 @@ fn serve_conn(w: Arc<Wireless>, cfg: Arc<rustls::ServerConfig>, stream: TcpStrea
 
         // 逐帧上行兜底：WSS 因证书/网络环境被拦时，手机改用同源 HTTPS POST 推帧。
         if path == "/frame" && req.method == "POST" {
-            if req.query_param("t").as_deref() != Some(w.token().as_str()) {
+            if !req.query_param("t").is_some_and(|t| w.valid_token(&t)) {
                 w.note_error("配对码无效：手机推流被拒");
                 let _ = http::write_status(rd.get_mut(), 403, "Forbidden");
                 return;
@@ -722,7 +724,7 @@ fn serve_conn(w: Arc<Wireless>, cfg: Arc<rustls::ServerConfig>, stream: TcpStrea
             }
             let name = req.query_param("name");
             let len = body.len();
-            w.mark_connected(name.as_deref());
+            w.mark_connected(0, name.as_deref());
             w.push_frame(body);
             w.note_frame(len, false);
             if http::write_response_keep_alive(rd.get_mut(), 204, "No Content", "text/plain; charset=utf-8", b"").is_err() {
@@ -733,18 +735,18 @@ fn serve_conn(w: Arc<Wireless>, cfg: Arc<rustls::ServerConfig>, stream: TcpStrea
 
         // 手机离开页面：撤销「已连接」，让界面回到等待扫码。
         if path == "/bye" {
-            if req.query_param("t").as_deref() != Some(w.token().as_str()) {
+            if !req.query_param("t").is_some_and(|t| w.valid_token(&t)) {
                 let _ = http::write_status(rd.get_mut(), 403, "Forbidden");
                 return;
             }
-            w.mark_disconnected(Some("手机已断开连接".into()));
+            w.mark_disconnected(0);
             let _ = http::write_response_keep_alive(rd.get_mut(), 204, "No Content", "text/plain; charset=utf-8", b"");
             continue;
         }
 
         // 手机页与图标：需要正确配对 token
         if path == "/" || path == "/index.html" {
-            let token_ok = req.query_param("t").as_deref() == Some(w.token().as_str());
+            let token_ok = req.query_param("t").is_some_and(|t| w.valid_token(&t));
             if !token_ok {
                 w.note_error("配对码无效：手机打开的是旧二维码地址");
                 let _ = http::write_response(
@@ -793,76 +795,52 @@ fn serve_conn(w: Arc<Wireless>, cfg: Arc<rustls::ServerConfig>, stream: TcpStrea
 }
 
 fn ws_loop(w: Arc<Wireless>, mut ws: WsConn<rustls::StreamOwned<rustls::ServerConnection, TcpStream>>) {
-    let mut authed = false;
-    let mut name: Option<String> = None;
-    // 本连接收到的帧数：随每帧回执发给手机，手机据此限制「在途帧」数量。
+    let id = w.next_ws_id.fetch_add(1, Ordering::Relaxed);
+    let mut paired_token = None;
+    let mut name = None;
     let mut frames_in: u64 = 0;
-    loop {
-        let msg = match ws.read_message() {
-            Ok(Some(m)) => m,
-            _ => break,
-        };
+    while let Ok(Some(msg)) = ws.read_message() {
         match msg {
             WsMsg::Binary(data) => {
-                if authed {
-                    let len = data.len();
-                    w.push_frame(data);
-                    w.note_frame(len, true);
-                    frames_in += 1;
-                    // 逐帧回执：WebSocket 的 bufferedAmount 只反映本地缓冲，
-                    // 反映不了 Wi-Fi 上真正排队的帧。手机靠这个数字把在途帧控制在 2–3 帧，
-                    // 弱网时主动丢帧换实时性，而不是让画面越积越旧。
-                    let _ = ws.write_text(&format!("{{\"type\":\"ack\",\"n\":{frames_in}}}"));
+                let Some(token) = paired_token.as_deref() else { continue };
+                if !w.valid_token(token) {
+                    let _ = ws.write_text("{\"type\":\"error\",\"message\":\"配对码无效\"}");
+                    break;
                 }
+                let len = data.len();
+                w.mark_connected(id, name.as_deref());
+                w.push_frame(data);
+                w.note_frame(len, true);
+                frames_in += 1;
+                if ws.write_text(&format!("{{\"type\":\"ack\",\"n\":{frames_in}}}")).is_err() { break; }
             }
             WsMsg::Text(text) => {
                 let v: serde_json::Value = serde_json::from_str(&text).unwrap_or(serde_json::Value::Null);
+                let read_name = || v.get("name").and_then(|s| s.as_str()).map(str::to_owned);
                 match v.get("type").and_then(|t| t.as_str()) {
                     Some("hello") => {
                         let token = v.get("token").and_then(|t| t.as_str()).unwrap_or_default();
-                        if token.is_empty() || token != w.token() {
+                        if !w.valid_token(token) {
                             w.note_error("配对码无效：手机 WSS 握手被拒");
                             let _ = ws.write_text("{\"type\":\"error\",\"message\":\"配对码无效\"}");
                             break;
                         }
-                        authed = true;
-                        name = v.get("name").and_then(|t| t.as_str()).map(|s| s.trim().to_string());
-                        if let Ok(mut c) = w.connected.lock() {
-                            *c = name.clone();
-                        }
-                        let _ = w.tx.send(Event::Wireless { connected: true, name: name.clone(), hint: None });
-                        let _ = ws.write_text("{\"type\":\"hello-ok\"}");
+                        paired_token = Some(token.to_owned());
+                        name = read_name();
+                        if ws.write_text("{\"type\":\"hello-ok\"}").is_err() { break; }
                     }
-                    Some("name") => {
-                        let new_name = v.get("name").and_then(|t| t.as_str()).map(|s| s.trim().to_string());
-                        if authed && new_name != name {
-                            name = new_name;
-                            if let Ok(mut c) = w.connected.lock() {
-                                *c = name.clone();
-                            }
-                            let _ = w.tx.send(Event::Wireless { connected: true, name: name.clone(), hint: None });
-                        }
-                    }
-                    Some("ping") => {
-                        let _ = ws.write_text("{\"type\":\"pong\"}");
-                    }
+                    Some("name") => name = read_name(),
+                    Some("ping") => { let _ = ws.write_text("{\"type\":\"pong\"}"); }
                     _ => {}
                 }
             }
-            WsMsg::Ping(data) => {
-                let _ = ws.write_pong(&data);
-            }
+            WsMsg::Ping(data) => { let _ = ws.write_pong(&data); }
             WsMsg::Pong => {}
             WsMsg::Close => break,
         }
     }
     let _ = ws.close();
-    if authed {
-        if let Ok(mut c) = w.connected.lock() {
-            *c = None;
-        }
-        let _ = w.tx.send(Event::Wireless { connected: false, name, hint: Some("手机已断开连接".into()) });
-    }
+    w.mark_disconnected(id);
 }
 
 #[cfg(test)]
@@ -1026,10 +1004,7 @@ mod tests {
         let (tx, events) = channel();
         let w = Wireless::new(tx);
         let info = w.ensure_started();
-        if !info.available {
-            eprintln!("跳过：无线服务不可用（{}）", info.hint);
-            return;
-        }
+        assert!(info.available, "无线服务不可用：{}", info.hint);
         let (mut frames, pending) = w.subscribe();
         assert!(pending.is_none(), "还没有帧时不应有缓冲帧");
 
@@ -1067,10 +1042,28 @@ mod tests {
             Some(WsMsg::Text(t)) => assert!(t.contains("hello-ok"), "应收到 hello-ok：{t}"),
             other => panic!("期望 hello-ok，得到 {other:?}"),
         }
-        let frame = vec![0xFF, 0xD8, 0x11, 0x22, 0xFF, 0xD9];
-        ws.write_binary(&frame).unwrap();
-        let got = frames.recv_timeout(Duration::from_secs(3)).expect("后端应收到手机帧");
-        assert_eq!(got, frame);
+        // 用实际编码的高细节 JPEG 测试三个档位，并检查大帧后的 ACK 对齐。
+        for (i, width) in [640, 960, 1280].into_iter().enumerate() {
+            let height = width * 9 / 16;
+            let mut seed = 1u32;
+            let rgb: Vec<u8> = (0..width * height * 3).map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                (seed >> 24) as u8
+            }).collect();
+            let mut frame = Vec::new();
+            image::codecs::jpeg::JpegEncoder::new_with_quality(&mut frame, 80)
+                .encode(&rgb, width, height, image::ExtendedColorType::Rgb8)
+                .unwrap();
+            assert!(frame.len() > u16::MAX as usize);
+            ws.write_binary(&frame).unwrap();
+            let got = frames.recv_timeout(Duration::from_secs(3)).expect("后端应收到完整手机帧");
+            assert_eq!(got, frame);
+            assert_eq!(crate::ffmpeg::jpeg_size(&got), Some((width, height)));
+            match ws.read_message().unwrap() {
+                Some(WsMsg::Text(t)) => assert_eq!(t, format!("{{\"type\":\"ack\",\"n\":{}}}", i + 1)),
+                other => panic!("期望 ACK，得到 {other:?}"),
+            }
+        }
 
         // 3. 事件流：手机上线通知
         let mut connected = false;
@@ -1086,6 +1079,33 @@ mod tests {
         }
         assert!(connected, "应收到手机上线事件");
         w.clear_sink();
+    }
+
+    #[test]
+    fn repeated_post_frames_do_not_flood_connection_events() {
+        let (tx, events) = channel();
+        let w = Wireless::new(tx);
+        w.mark_connected(0, Some("phone"));
+        w.mark_connected(0, Some("phone"));
+        w.mark_connected(0, None);
+        assert_eq!(events.try_iter().count(), 1);
+        w.mark_disconnected(0);
+        w.mark_connected(0, Some("phone"));
+        assert_eq!(events.try_iter().count(), 2);
+    }
+
+    #[test]
+    fn stale_websocket_disconnect_does_not_clear_fallback_uplink() {
+        let (tx, events) = channel();
+        let w = Wireless::new(tx);
+        w.mark_connected(1, Some("phone"));
+        w.mark_connected(2, Some("phone"));
+        w.mark_disconnected(1);
+        assert_eq!(w.diag()["connected"], true);
+        assert_eq!(events.try_iter().count(), 1);
+        w.mark_disconnected(2);
+        assert_eq!(w.diag()["connected"], false);
+        assert!(matches!(events.try_recv(), Ok(Event::Wireless { connected: false, .. })));
     }
 
     /// 兜底通道：WSS 握手失败时手机改用 HTTPS POST 逐帧推流（同一连接复用）。

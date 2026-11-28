@@ -7,7 +7,7 @@
 
 | 命令 | 入参 | 返回 |
 | --- | --- | --- |
-| `app_info` | — | `{ streamUrl: string, mediaBase: string, version: string }` |
+| `app_info` | — | `{ streamUrl: string, previewUrl: string, mediaBase: string, version: string }` |
 | `list_devices` | — | `{ av: {index:number,name:string}[], android: {serial:string,model:string}[], ffmpegOk: boolean, adbOk: boolean }` |
 | `start_source` | `{ kind: "av"\|"android"\|"wireless", id: string }` | `{ gen: number, state: "starting" }` |
 | `stop_source` | — | `{ ok: true }` |
@@ -39,9 +39,11 @@
 | `wireless` | `{ connected:boolean, name:string\|null, hint:string\|null }` |
 | `notice` | `{ text:string, level:"info"\|"error" }` |
 
-## 3. 画面传输：本地单帧长轮询
+## 3. 画面传输：本地 WebSocket + 单帧长轮询
 
-`app_info.streamUrl` = `http://127.0.0.1:PORT/frame.jpg`（每次响应都是一张完整 JPEG）。
+`app_info.previewUrl` 指向 `ws://127.0.0.1:PORT/preview?t=<本进程令牌>`。升级请求须携带令牌及应用 Origin（WKWebView 的 `null` 需同样通过令牌校验）。客户端发 `next`，服务端最多等 1 秒后回最新的 JPEG 二进制帧，或者回文本 `idle` 表示无新帧。客户端处理完成再发下一条 `next`，慢消费者不累积旧帧。
+
+`app_info.streamUrl` 仍指向 `/stream`（兼容旧客户端）。WebSocket 不可用时从同地址的 `/frame.jpg` 读取，每次响应都是一张完整 JPEG。
 
 请求带两个查询参数：
 
@@ -51,10 +53,10 @@
 响应：
 
 - `200` + `image/jpeg`：头里带 `X-Frame-Seq: <n>`（单调递增）与 CORS 头（`Access-Control-Allow-Origin: *`、`Access-Control-Expose-Headers: X-Frame-Seq`），前端把 `n` 写进下一次的 `v`。
-- `204 No Content`：带了 `v`，但 `wait` 内没有新帧。这不是错误，前端立刻发起下一次等待（长轮询的「空转」是零成本的）。
+- `204 No Content`：带了 `v`，但 `wait` 内没有新帧。这不是错误，前端立刻发起下一次等待。
 - `404`：当前没有任何帧（还没连上源、或已停止），前端退避约 120ms 再试。
 
-前端解析：`createImageBitmap(new Blob([bytes],{type:"image/jpeg"}))` → `ctx.drawImage(bitmap, ...)` 到画布 → `bitmap.close()`；解码失败跳过该帧，不断流；切源时 `gen` 变化立刻 abort 在途请求并丢弃旧帧。
+前端在背面 `<img>` 解码，成功后才切到前面；坏帧及短暂断线保留上一帧。切源时关闭 WebSocket、取消在途 HTTP，并丢弃旧连接的迟到结果。
 
 **不要**把这里改回 `fetch` + `multipart/x-mixed-replace`（`/stream`）：WKWebView 打开该流后第一次 `read()` 直接 `TypeError: Load failed`，一帧都收不到。`/stream` 端点仅为 curl、测试与旧客户端保留。
 

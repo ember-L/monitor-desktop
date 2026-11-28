@@ -1,8 +1,9 @@
-//! 本机取景器 HTTP 服务：给 WebView 推送 MJPEG 预览，并提供素材文件/缩略图/配对二维码。
+//! 本机取景器 HTTP 服务：给 WebView 推送 JPEG 预览，并提供素材文件/缩略图/配对二维码。
 //! 只监听 127.0.0.1 随机端口，进程退出即失效。
 
 use crate::capture;
-use crate::http::{self, parse_range};
+use crate::http::{self, parse_range, WsConn, WsMsg};
+use base64::{engine::general_purpose::{STANDARD, URL_SAFE_NO_PAD}, Engine as _};
 use std::collections::HashMap;
 use std::io::{BufReader, Write};
 use std::net::{TcpListener, TcpStream};
@@ -18,6 +19,7 @@ struct Latest {
 pub struct Viewer {
     pub port: u16,
     root: PathBuf,
+    preview_token: String,
     latest: Mutex<Latest>,
     cv: Condvar,
     qr: Mutex<Option<Arc<Vec<u8>>>>,
@@ -28,9 +30,13 @@ impl Viewer {
     pub fn start(root: PathBuf) -> std::io::Result<Arc<Viewer>> {
         let listener = TcpListener::bind(("127.0.0.1", 0))?;
         let port = listener.local_addr()?.port();
+        let mut secret = [0; 16];
+        rustls::crypto::ring::default_provider().secure_random.fill(&mut secret)
+            .map_err(|_| std::io::Error::other("无法生成本机预览令牌"))?;
         let viewer = Arc::new(Viewer {
             port,
             root,
+            preview_token: URL_SAFE_NO_PAD.encode(secret),
             latest: Mutex::new(Latest { seq: 0, jpeg: None }),
             cv: Condvar::new(),
             qr: Mutex::new(None),
@@ -53,6 +59,10 @@ impl Viewer {
 
     pub fn url(&self, path: &str) -> String {
         format!("{}{}", self.base(), path)
+    }
+
+    pub fn preview_url(&self) -> String {
+        format!("ws://127.0.0.1:{}/preview?t={}", self.port, self.preview_token)
     }
 
     pub fn set_frame(&self, jpeg: Arc<Vec<u8>>) {
@@ -116,6 +126,7 @@ impl Viewer {
     fn handle(&self, mut stream: TcpStream) {
         // 本机回环也要关 Nagle：逐帧小响应攒包会让每帧多等几十毫秒。
         let _ = stream.set_nodelay(true);
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
         let mut rd = BufReader::new(match stream.try_clone() {
             Ok(s) => s,
@@ -126,6 +137,10 @@ impl Viewer {
             Err(_) => return,
         };
         let path = req.path.clone();
+        if path == "/preview" {
+            let _ = self.serve_preview(&req, rd);
+            return;
+        }
         if path == "/stream" {
             self.serve_stream(stream);
             return;
@@ -306,6 +321,49 @@ impl Viewer {
     }
 
     /// MJPEG：每帧一个 JPEG part，紧跟最新帧；客户端断开即退出。
+    fn serve_preview(&self, req: &http::Request, mut rd: BufReader<TcpStream>) -> std::io::Result<()> {
+        // WKWebView 可能把自定义协议的 Origin 序列化为 null；令牌仅通过 Tauri IPC 下发。
+        if req.query_param("t").as_deref() != Some(self.preview_token.as_str())
+            || !matches!(req.header("origin"), Some("tauri://localhost" | "http://tauri.localhost" | "null"))
+        {
+            return http::write_status(rd.get_mut(), 403, "Forbidden");
+        }
+        let Some(key) = req.header("sec-websocket-key").filter(|key| STANDARD.decode(key).is_ok_and(|bytes| bytes.len() == 16)) else {
+            return http::write_status(rd.get_mut(), 400, "Bad Request");
+        };
+        if req.method != "GET" || req.version != "HTTP/1.1" || !req.is_websocket_upgrade()
+            || req.header("sec-websocket-version") != Some("13")
+            || !req.header("connection").is_some_and(|v| v.split(',').any(|part| part.trim().eq_ignore_ascii_case("upgrade")))
+        {
+            return http::write_status(rd.get_mut(), 400, "Bad Request");
+        }
+        rd.get_ref().set_write_timeout(Some(Duration::from_secs(3)))?;
+        http::write_head(rd.get_mut(), 101, "Switching Protocols", &[
+            ("Upgrade", "websocket".into()),
+            ("Connection", "Upgrade".into()),
+            ("Sec-WebSocket-Accept", http::ws_accept_key(key)),
+        ])?;
+        let mut ws = WsConn::with_reader(rd);
+        let mut seq = None;
+        while let Some(msg) = ws.read_message()? {
+            match msg {
+                WsMsg::Text(text) if text == "next" => {
+                    // 浏览器上一帧处理完才索取下一帧；慢时跳到最新帧，不累积延迟。
+                    if let Some((current, jpeg)) = self.snapshot(seq, Duration::from_secs(1)) {
+                        ws.write_binary(&jpeg)?;
+                        seq = Some(current);
+                    } else {
+                        ws.write_text("idle")?;
+                    }
+                }
+                WsMsg::Ping(data) => ws.write_pong(&data)?,
+                WsMsg::Pong => {},
+                _ => break,
+            }
+        }
+        ws.close()
+    }
+
     fn serve_stream(&self, mut stream: TcpStream) {
         let head = format!(
             "HTTP/1.1 200 OK\r\nContent-Type: multipart/x-mixed-replace; boundary=frame\r\nCache-Control: no-store\r\nPragma: no-cache\r\nAccess-Control-Allow-Origin: *\r\nConnection: close\r\n\r\n"
@@ -345,7 +403,7 @@ impl Viewer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
+    use std::io::{BufRead, Read, Write};
 
     fn temp_root(tag: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("monitor-viewer-{tag}-{}", std::process::id()));
@@ -374,6 +432,52 @@ mod tests {
             }
         }
         out
+    }
+
+    fn preview_request(target: &str, origin: &str) -> String {
+        format!("GET {target} HTTP/1.1\r\nHost: x\r\nOrigin: {origin}\r\nUpgrade: websocket\r\nConnection: keep-alive, Upgrade\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")
+    }
+
+    #[test]
+    fn preview_requires_token_and_application_origin() {
+        let root = temp_root("preview-forbidden");
+        let viewer = Viewer::start(root.clone()).unwrap();
+        let target = format!("/preview?t={}", viewer.preview_token);
+        for (path, origin) in [("/preview", "null"), (&target, "https://example.org")] {
+            let raw = request(viewer.port, &preview_request(path, origin));
+            assert!(header_of(&raw).starts_with("HTTP/1.1 403"), "{}", header_of(&raw));
+        }
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn preview_sends_latest_only_and_heartbeats_when_idle() {
+        let root = temp_root("preview-ws");
+        let viewer = Viewer::start(root.clone()).unwrap();
+        let target = format!("/preview?t={}", viewer.preview_token);
+        let mut rd = BufReader::new(connect(viewer.port));
+        rd.get_mut().write_all(preview_request(&target, "http://tauri.localhost").as_bytes()).unwrap();
+        let mut line = String::new();
+        rd.read_line(&mut line).unwrap();
+        assert!(line.starts_with("HTTP/1.1 101"), "{line}");
+        while line != "\r\n" {
+            line.clear();
+            assert!(rd.read_line(&mut line).unwrap() > 0);
+        }
+        let mut ws = WsConn::with_reader(rd);
+        let jpeg = Arc::new(vec![1; 540_000]);
+        viewer.set_frame(jpeg.clone());
+        ws.write_text("next").unwrap();
+        assert!(matches!(ws.read_message().unwrap(), Some(WsMsg::Binary(data)) if data == *jpeg));
+        viewer.set_frame(Arc::new(vec![2; jpeg.len()]));
+        let newest = Arc::new(vec![3; jpeg.len()]);
+        viewer.set_frame(newest.clone());
+        ws.write_text("next").unwrap();
+        assert!(matches!(ws.read_message().unwrap(), Some(WsMsg::Binary(data)) if data == *newest));
+        ws.write_text("next").unwrap();
+        assert!(matches!(ws.read_message().unwrap(), Some(WsMsg::Text(text)) if text == "idle"));
+        ws.close().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]

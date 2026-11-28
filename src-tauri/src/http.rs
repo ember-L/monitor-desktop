@@ -239,72 +239,98 @@ pub enum WsMsg {
 /// 服务端 WebSocket 连接：读客户端（必带掩码）帧，写服务端（不掩码）帧。
 pub struct WsConn<S: Read + Write> {
     rd: BufReader<S>,
+    fragmented: Option<(u8, Vec<u8>)>,
     closed: bool,
 }
 
 impl<S: Read + Write> WsConn<S> {
     #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(stream: S) -> Self {
-        Self { rd: BufReader::with_capacity(64 * 1024, stream), closed: false }
+        Self::with_reader(BufReader::new(stream))
     }
 
     /// 复用已解析过请求头的 BufReader（保留其中可能已缓冲的数据）。
     pub fn with_reader(rd: BufReader<S>) -> Self {
-        Self { rd, closed: false }
-    }
-
-    fn read_exact_buf(&mut self, n: usize) -> io::Result<Vec<u8>> {
-        let mut buf = vec![0u8; n];
-        self.rd.read_exact(&mut buf)?;
-        Ok(buf)
+        Self { rd, fragmented: None, closed: false }
     }
 
     pub fn read_message(&mut self) -> io::Result<Option<WsMsg>> {
-        let mut b0 = [0u8; 2];
-        self.rd.read_exact(&mut b0)?;
-        let opcode = b0[0] & 0x0F;
-        let masked = b0[1] & 0x80 != 0;
-        let len7 = (b0[1] & 0x7F) as u64;
-        let len = match len7 {
-            126 => {
-                let b = self.read_exact_buf(2)?;
-                u16::from_be_bytes([b[0], b[1]]) as u64
+        const MAX_MESSAGE: u64 = 16 * 1024 * 1024;
+        let invalid = || io::Error::new(io::ErrorKind::InvalidData, "无效的 WebSocket 帧");
+        loop {
+            let mut head = [0u8; 2];
+            self.rd.read_exact(&mut head)?;
+            let fin = head[0] & 0x80 != 0;
+            let opcode = head[0] & 0x0F;
+            let control = opcode >= 0x8;
+            let len7 = (head[1] & 0x7F) as u64;
+            if head[0] & 0x70 != 0 || (control && (!fin || len7 > 125)) {
+                return Err(invalid());
             }
-            127 => {
-                let b = self.read_exact_buf(8)?;
-                let mut a = [0u8; 8];
-                a.copy_from_slice(&b);
-                u64::from_be_bytes(a)
+            let len = match len7 {
+                126 => {
+                    let mut n = [0; 2];
+                    self.rd.read_exact(&mut n)?;
+                    u16::from_be_bytes(n) as u64
+                }
+                127 => {
+                    let mut n = [0; 8];
+                    self.rd.read_exact(&mut n)?;
+                    u64::from_be_bytes(n)
+                }
+                n => n,
+            };
+            let (opcode, mut payload) = match opcode {
+                0x0 => self.fragmented.take().ok_or_else(invalid)?,
+                0x1 | 0x2 if self.fragmented.is_none() => (opcode, Vec::new()),
+                0x8..=0xA => (opcode, Vec::new()),
+                _ => return Err(invalid()),
+            };
+            let start = payload.len();
+            if len > MAX_MESSAGE - start as u64 {
+                return Err(io::Error::new(io::ErrorKind::InvalidData, "消息过大"));
             }
-            n => n,
-        };
-        if len > 16 * 1024 * 1024 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "帧过大"));
+            let masked = head[1] & 0x80 != 0;
+            let mut mask = [0; 4];
+            if masked {
+                self.rd.read_exact(&mut mask)?;
+            }
+            payload.resize(start + len as usize, 0);
+            let bytes = &mut payload[start..];
+            self.rd.read_exact(bytes)?;
+            if masked {
+                for (byte, key) in bytes.iter_mut().zip(mask.iter().cycle()) {
+                    *byte ^= key;
+                }
+            }
+            if !fin {
+                self.fragmented = Some((opcode, payload));
+                continue;
+            }
+            return Ok(Some(match opcode {
+                0x1 => WsMsg::Text(String::from_utf8_lossy(&payload).into_owned()),
+                0x2 => WsMsg::Binary(payload),
+                0x8 => WsMsg::Close,
+                0x9 => WsMsg::Ping(payload),
+                _ => WsMsg::Pong,
+            }));
         }
-        let mask = if masked { self.read_exact_buf(4)? } else { Vec::new() };
-        let mut payload = self.read_exact_buf(len as usize)?;
-        if masked && mask.len() == 4 {
-            for (i, byte) in payload.iter_mut().enumerate() {
-                *byte ^= mask[i % 4];
-            }
-        }
-        Ok(Some(match opcode {
-            0x1 => WsMsg::Text(String::from_utf8_lossy(&payload).to_string()),
-            0x2 => WsMsg::Binary(payload),
-            0x8 => WsMsg::Close,
-            0x9 => WsMsg::Ping(payload),
-            0xA => WsMsg::Pong,
-            _ => WsMsg::Pong,
-        }))
     }
 
     fn write_frame(&mut self, opcode: u8, payload: &[u8]) -> io::Result<()> {
         let w = self.rd.get_mut();
-        let mut head = vec![0x80 | opcode];
         let len = payload.len();
         if len < 126 {
-            head.push(len as u8);
-        } else if len <= u16::MAX as usize {
+            // ACK 头和正文一起写，避免 rustls 为每个小回执发两次 TLS 记录。
+            let mut frame = [0; 127];
+            frame[0] = 0x80 | opcode;
+            frame[1] = len as u8;
+            frame[2..2 + len].copy_from_slice(payload);
+            w.write_all(&frame[..2 + len])?;
+            return w.flush();
+        }
+        let mut head = vec![0x80 | opcode];
+        if len <= u16::MAX as usize {
             head.push(126);
             head.extend_from_slice(&(len as u16).to_be_bytes());
         } else {
@@ -385,6 +411,37 @@ mod tests {
             WsMsg::Binary(v) => assert_eq!(v, payload.to_vec()),
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn reassembles_large_jpeg_with_interleaved_ping() {
+        let first = vec![0xAB; 70_000];
+        let last = b"end";
+        let mut raw = Vec::new();
+        for (kind, data) in [(0x02, first.as_slice()), (0x89, b"ping"), (0x80, last)] {
+            raw.push(kind);
+            if data.len() > 125 {
+                raw.push(0xFF);
+                raw.extend_from_slice(&(data.len() as u64).to_be_bytes());
+            } else {
+                raw.push(0x80 | data.len() as u8);
+            }
+            let mask = [0x37, 0xFA, 0x21, 0x3D];
+            raw.extend_from_slice(&mask);
+            raw.extend(data.iter().zip(mask.iter().cycle()).map(|(byte, mask)| byte ^ mask));
+        }
+        let mut conn = WsConn::new(Cursor::new(raw));
+        assert!(matches!(conn.read_message().unwrap(), Some(WsMsg::Ping(v)) if v == b"ping"));
+        let Some(WsMsg::Binary(jpeg)) = conn.read_message().unwrap() else { panic!("missing JPEG") };
+        assert_eq!(jpeg.len(), first.len() + last.len());
+        assert_eq!(&jpeg[..first.len()], first);
+        assert_eq!(&jpeg[first.len()..], last);
+    }
+
+    #[test]
+    fn rejects_continuation_without_initial_frame() {
+        let mut conn = WsConn::new(Cursor::new([0x80, 0x00]));
+        assert_eq!(conn.read_message().unwrap_err().kind(), io::ErrorKind::InvalidData);
     }
 
     #[test]
